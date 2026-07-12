@@ -5,6 +5,8 @@
 #include "bms_analysis.h"
 #include "bms_energy.h"
 #include "bms_can_task.h"
+#include "bms_config.h"
+#include "bms_init.h"
 #include "FreeRTOS.h"
 #include "queue.h"
 #include "task.h"
@@ -368,12 +370,17 @@ static void Cmd_Protect(void)
     printf("[PROTECT] Pending: OV=%d UV=%d OCD=%d SCD=%d\r\n",
            (int)prot->ov_pending, (int)prot->uv_pending,
            (int)prot->ocd_pending, (int)prot->scd_pending);
+    printf("[PROTECT] OCC=%d OTC=%d OTD=%d LTC=%d LTD=%d FAILSAFE=%d SAFE=%d\r\n",
+           (int)prot->occ_active, (int)prot->otc_active,
+           (int)prot->otd_active, (int)prot->ltc_active,
+           (int)prot->ltd_active, (int)prot->fail_safe_active,
+           (int)prot->safe_off_confirmed);
     printf("[PROTECT] Allow: CHG=%d DSG=%d\r\n",
            (int)prot->charge_allowed, (int)prot->discharge_allowed);
-    printf("[PROTECT] LastFault: %s Cell=%d Value=%lu\r\n",
+    printf("[PROTECT] LastFault: %s Cell=%d Value=%ld\r\n",
            BMS_ProtectFaultToString(prot->last_fault),
            (int)prot->last_fault_cell,
-           (unsigned long)prot->last_fault_value);
+           (long)prot->last_fault_value);
 }
 
 static void Cmd_Status(void)
@@ -591,11 +598,26 @@ void BMS_UartCmd_ProcessLine(const char *line)
     }
     else if (strcmp(line, "ship") == 0 || strcmp(line, "shutdown") == 0)
     {
+        if (!BMS_InitIsOk())
+        {
+            printf("[CMD] ERROR: BMS initialization is not complete.\r\n");
+            return;
+        }
         printf("[CMD] CRITICAL: Entering BQ769X0 SHIP mode (shutdown).\r\n");
         printf("[CMD] TS1 high pulse on PA15 is required to wake up.\r\n");
         osDelay(100);
-        BQ769X0_ForceSafeOff();
-        BQ769X0_EntryShip();
+        if (!BQ769X0_ForceSafeOff(BMS_SAFE_OFF_RETRY_COUNT))
+        {
+            printf("[CMD] ERROR: safe-off verification failed; shutdown cancelled.\r\n");
+        }
+        else if (!BQ769X0_EntryShip())
+        {
+            printf("[CMD] ERROR: SHIP command failed.\r\n");
+        }
+        else
+        {
+            BMS_ProtectLatchShutdown();
+        }
     }
     else if (strncmp(line, "set ", 4) == 0)
     {

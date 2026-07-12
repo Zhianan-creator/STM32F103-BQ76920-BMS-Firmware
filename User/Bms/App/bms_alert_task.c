@@ -1,9 +1,13 @@
 #include "bms_alert_task.h"
+#include "bms_init.h"
+#include "bms_config.h"
+#include "bms_protect.h"
 #include "drv_softi2c_bq769x0.h"
 #include "FreeRTOS.h"
 #include "task.h"
 #include <stdio.h>
 
+/* 接收 ALERT 中断通知，并通过定时轮询兜底处理保持为高电平的告警。 */
 void BMS_AlertTask(void *argument)
 {
     (void)argument;
@@ -12,14 +16,24 @@ void BMS_AlertTask(void *argument)
     TaskHandle_t xTaskHandle = xTaskGetCurrentTaskHandle();
     BQ769X0_RegisterAlertTask(xTaskHandle);
 
+    if (BMS_InitWaitDone() != 0)
+    {
+        for (;;)
+        {
+            vTaskDelay(pdMS_TO_TICKS(BMS_ALERT_POLL_MS));
+        }
+    }
+
     for (;;)
     {
-        /*
-         * 无限阻塞等待 ISR 任务通知
-         * ISR (HAL_GPIO_EXTI_Callback) 中通过 vTaskNotifyGiveFromISR 唤醒
-         * 唤醒后在任务上下文中安全读取 SYS_STAT 寄存*/
-        ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+        const BMS_ProtectState_t *protect = BMS_ProtectGetState();
 
-        BQ769X0_ProcessAlert();
+        if ((protect != NULL) && protect->shutdown_active)
+        {
+            vTaskDelay(pdMS_TO_TICKS(BMS_ALERT_POLL_MS));
+            continue;
+        }
+        (void)ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(BMS_ALERT_POLL_MS));
+        (void)BQ769X0_ProcessAlert();
     }
 }

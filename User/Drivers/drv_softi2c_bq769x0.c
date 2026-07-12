@@ -32,8 +32,9 @@
  *
  * 主要改动相比原RT-Thread版本):
  *   1. 删除rtdbg.h日志系统,改用printf(默认关闭)
- *   2. ALERT处理: ISR中仅设置标志,任务中读取寄存器并执行回*   3. 删除bms_config.h依赖,使用可覆盖的默认配置
- *   4. 延时函数: rt_thread_mdelay -> osDelay(CMSIS-RTOS2)
+ *   2. ALERT 处理：ISR 发送任务通知，任务读取并清除状态
+ *   3. 删除 bms_config.h 依赖，使用可覆盖的默认配置
+ *   4. 延时函数改用 CMSIS-RTOS2 osDelay
  *
  * 硬件连接:
  *   BQ769X0 I2C地址: 0x08 (7位)
@@ -68,18 +69,25 @@
  * BQ769X0 公共寄存器读API 内部自动加锁/解锁
  *========================================================================*/
 static SemaphoreHandle_t bq_bus_mutex = NULL;
+static StaticSemaphore_t bq_bus_mutex_buffer;
 
-void BQ769X0_BusLockInit(void)
+/* 创建 BQ 总线递归互斥锁；重复调用不会重复分配。 */
+bool BQ769X0_BusLockInit(void)
 {
-    bq_bus_mutex = xSemaphoreCreateRecursiveMutex();
+    if (bq_bus_mutex != NULL)
+    {
+        return true;
+    }
+
+    bq_bus_mutex = xSemaphoreCreateRecursiveMutexStatic(&bq_bus_mutex_buffer);
     if (bq_bus_mutex == NULL)
     {
         BQ769X0_RUNTIME_PRINTF("[BQ LOCK] mutex init FAILED\r\n");
+        return false;
     }
-    else
-    {
-        BQ769X0_RUNTIME_PRINTF("[BQ LOCK] mutex init OK\r\n");
-    }
+
+    BQ769X0_RUNTIME_PRINTF("[BQ LOCK] mutex init OK\r\n");
+    return true;
 }
 
 void BQ769X0_BusLock(void)
@@ -136,20 +144,13 @@ static uint8_t TempSampleMode = 0;
  * 这样可以减少I2C通信次数,并且方便按位操作
  */
 static RegisterGroup Registers = {0};
+static uint8_t s_cell_balance_value[3] = {0};
 
 
-/*
- * ALERT告警待处理标用于ISR到任务的通知)
- *
- * 原RT-Thread版本在HAL_GPIO_EXTI_Callback中直接调用BQ769X0_AlertyHandler(),
- * 该函数会读写I2C寄存器。但在FreeRTOS
- *   - osMutexAcquire不能在ISR中调*   - HAL_GPIO_Init不能在ISR中调*   - 长时间的I2C操作会阻塞中断处*
- * 解决方案: ISR中仅设置这个volatile标志,任务中通过BQ769X0_ProcessAlert()处理
- * volatile关键字告诉编译器不要优化掉对此变量的读写(因为它会被ISR修改)
- */
-static volatile uint8_t bq_alert_pending = 0;
-static TaskHandle_t alert_task_handle = NULL;
+/* ALERT ISR 只读取该句柄并发送任务通知。 */
+static volatile TaskHandle_t alert_task_handle = NULL;
 
+/* 注册接收 ALERT 通知的任务句柄。 */
 void BQ769X0_RegisterAlertTask(TaskHandle_t task_handle)
 {
 	alert_task_handle = task_handle;
@@ -222,18 +223,12 @@ static void BQ769X0_TS1_SetInMode(void)
     HAL_GPIO_Init(BQ769X0_TS1_GPIO_Port, &GPIO_InitStruct);
 }
 
-/*
- * HAL外部中断回调函数 - ALERT引脚告警处理
- *
- * 当BQ769X0检测到异常(OCD/SCD/OV/UVALERT引脚产生上升* STM32的EXTI外设捕获到这个边沿后,调用此回调函*
- * FreeRTOS适配:
- *   原版本在此函数中直接调用BQ769X0_AlertyHandler()读取I2C寄存*   现在改为仅设置volatile标志,实际处理在BQ769X0_ProcessAlert()中完*   这样避免了在ISR中执行I2C操作(互斥锁、GPIO重初始化等不能在ISR中使
- */
+/* 在 HAL EXTI 回调中转发 BQ ALERT 任务通知。 */
 void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin)
 {
     if (GPIO_Pin == BQ769X0_ALERT_Pin)
     {
-        BQ769X0_AlertNotifyFromISR();  /* 仅设置标不在ISR中读寄存*/
+        BQ769X0_AlertNotifyFromISR();
     }
 }
 
@@ -367,26 +362,33 @@ static bool BQ769X0_WriteRegisterByteWithCRC(uint8_t Register, uint8_t data)
  *   buffer       - 待写入的数据数组
  *   length       - 数据长度(字节
  */
-bool BQ769X0_WriteBlockWithCRC(uint8_t startAddress, uint8_t *buffer, uint8_t length)
+/* 连续写入带 CRC 的寄存器数据块。 */
+bool BQ769X0_WriteBlockWithCRC(uint8_t startAddress, const uint8_t *buffer, uint8_t length)
 {
 	uint8_t index;
 	uint8_t bufferCRC[32] = {0}, *pointer;
+	const uint8_t *source = buffer;
 	struct I2C_MessageTypeDef msg = {0};
 	bool result = false;
+
+	if ((source == NULL) || (length == 0U) || (length > 15U))
+	{
+		return false;
+	}
 
 	BQ769X0_BusLock();
 
 	pointer = bufferCRC;
 	*pointer++ = BQ769X0_I2C_ADDR << 1;
 	*pointer++ = startAddress;
-	*pointer++ = *buffer;
+	*pointer++ = *source;
 	*pointer = CRC8(bufferCRC, 3, CRC_KEY);
 
 	for (index = 1; index < length; index++)
 	{
 		pointer++;
-		buffer++;
-		*pointer = *buffer;
+		source++;
+		*pointer = *source;
 		*(pointer + 1) = CRC8(pointer, 1, CRC_KEY);
 		pointer++;
 	}
@@ -612,7 +614,8 @@ out:
  *
  * 建议调用周期: 250ms
  */
-void BQ769X0_UpdateCellVolt(void)
+/* 更新全部单体电压；通信失败时不覆盖上次有效采样。 */
+bool BQ769X0_UpdateCellVolt(void)
 {
 	uint8_t index = 0;
 	uint16_t iTemp = 0;
@@ -624,6 +627,7 @@ void BQ769X0_UpdateCellVolt(void)
 	if (!read_ok)
 	{
 		BQ769X0_ERROR("Update Cell Voltage Fail");
+		return false;
 	}
 
 	/* 逐节换算 */
@@ -636,6 +640,8 @@ void BQ769X0_UpdateCellVolt(void)
 		BQ769X0_SampleData.CellVoltage[index] = lTemp / 1000.0;  /* 转为V */
 		pRawADCData += 2;  /* 指向下一节电*/
 	}
+
+	return true;
 }
 
 
@@ -656,7 +662,8 @@ void BQ769X0_UpdateCellVolt(void)
  *
  * 建议调用周期: 2s
  */
-void BQ769X0_UpdateTsTemp(void)
+/* 更新外部热敏电阻温度；通信或计算异常时不覆盖上次有效值。 */
+bool BQ769X0_UpdateTsTemp(void)
 {
 	uint8_t index;
 	uint16_t iTemp = 0;
@@ -667,12 +674,13 @@ void BQ769X0_UpdateTsTemp(void)
 	/* 如果当前不是NTC模式,需要切换并等待ADC稳定 */
 	if (TempSampleMode != 0)
 	{
-		TempSampleMode = 0;
 		/* SYS_CTRL1 = 0x18: ADC使能,选择外部NTC */
 		if (BQ769X0_WriteRegisterByteWithCRC(SYS_CTRL1, 0x18) != true)
 		{
 			BQ769X0_ERROR("Update Tsx Temperature Fail");
+			return false;
 		}
+		TempSampleMode = 0;
 		BQ769X0_DELAY(2000);  /* 等待ADC稳定 */
 	}
 
@@ -680,6 +688,7 @@ void BQ769X0_UpdateTsTemp(void)
 	if (BQ769X0_ReadBlockWithCRC(TS1_HI_BYTE, &(Registers.TS1.TS1Byte.TS1_HI), BQ769X0_TMEP_MAX << 1) != true)
 	{
 		BQ769X0_ERROR("Update Tsx Temperature Fail");
+		return false;
 	}
 
 	/* 逐通道换算温度 */
@@ -691,6 +700,11 @@ void BQ769X0_UpdateTsTemp(void)
 
 		/* 换算为电单位V): BQ769X0 ADC分辨率约0.382mV/LSB */
 		v_tsx = iTemp * 0.000382;
+		if ((v_tsx <= 0.0f) || (v_tsx >= 3.3f))
+		{
+			BQ769X0_ERROR("TS voltage out of range");
+			return false;
+		}
 
 		/* 根据分压电路计算热敏电阻阻单位Ω) */
 		/* 电路: 3.3V -- 10KΩ上拉 -- ADC采样-- NTC -- GND */
@@ -699,6 +713,8 @@ void BQ769X0_UpdateTsTemp(void)
 		/* 用B值方程将阻值换算为温度(单位°C) */
 		BQ769X0_SampleData.TsxTemperature[index] = TempChange(Rts);
 	}
+
+	return true;
 }
 
 
@@ -751,7 +767,8 @@ void BQ769X0_UpdateDieTemp(void)
  *
  * 建议调用周期: 250ms
  */
-void BQ769X0_UpdateCurrent(void)
+/* 更新电池电流；通信失败时不把故障伪装成零电流。 */
+bool BQ769X0_UpdateCurrent(void)
 {
 	int32_t temp;
 	bool read_ok = BQ769X0_ReadRegisterWordWithCRC(CC_HI_BYTE, &Registers.CC.CCWord);
@@ -759,8 +776,7 @@ void BQ769X0_UpdateCurrent(void)
 	if (!read_ok)
 	{
 		BQ769X0_ERROR("Update Current Fail");
-		BQ769X0_SampleData.BatteryCurrent = 0.0f;
-		return;
+		return false;
 	}
 
 	/* 组合高低字节 */
@@ -774,6 +790,7 @@ void BQ769X0_UpdateCurrent(void)
 
 	/* 换算为安A) */
 	BQ769X0_SampleData.BatteryCurrent = ((temp * 8.44) / RsnsValue) * 0.000001;
+	return true;
 }
 
 
@@ -785,77 +802,38 @@ void BQ769X0_UpdateCurrent(void)
  *
  * 建议调用周期: 250ms
  */
-void BQ769X0_UpadteBatVolt(void)
+/* 更新电池包总电压；通信失败时不覆盖上次有效采样。 */
+bool BQ769X0_UpadteBatVolt(void)
 {
 	uint16_t adc_value;
 
 	if (BQ769X0_ReadRegisterWordWithCRC(BAT_HI_BYTE, &Registers.VBat.VBatWord) != true)
 	{
 		BQ769X0_ERROR("Update Battery Voltage Fail");
+		return false;
 	}
 
 	adc_value = Registers.VBat.VBatByte.BAT_HI << 8 | Registers.VBat.VBatByte.BAT_LO;
 	BQ769X0_SampleData.BatteryVoltage = 4 * Gain * adc_value;
 	BQ769X0_SampleData.BatteryVoltage += BQ769X0_CELL_MAX * Adcoffset;  /* 单位mV */
 	BQ769X0_SampleData.BatteryVoltage /= 1000;  /* 转为V */
+	return true;
 }
 
 
-/*==========================================================================
- * ALERT告警处理 - FreeRTOS适配
- *
- * 原RT-Thread版本:
- *   HAL_GPIO_EXTI_Callback -> BQ769X0_AlertyHandler (ISR中直接读寄存
- *
- * FreeRTOS适配版本:
- *   HAL_GPIO_EXTI_Callback -> BQ769X0_AlertNotifyFromISR (仅设标志)
- *   任务循环 -> BQ769X0_ProcessAlert (读寄存器+执行回调+清除状
- *
- * 这种模式在RTOS中很常见,叫做"延迟中断处理"(Deferred Interrupt Processing)
- * ISR只做最少的工作(设标,耗时的操读寄存器、执行回在任务中完成
- *========================================================================*/
-
-/*
- * ISR中通知有告警事仅设置标
- *
- * 此函数在HAL_GPIO_EXTI_Callback中调处于中断上下* 只做一件事: 设置volatile标志* 不读寄存器、不发I2C、不延时、不输出日志
- *
- * volatile关键字确保编译器不会优化掉对此变量的写操* (因为编译器可能认为这个变量在当前函数中没有被读取)
- */
+/* 从 EXTI ISR 向 ALERT 任务发送通知，不在中断中执行 I2C。 */
 void BQ769X0_AlertNotifyFromISR(void)
 {
-	bq_alert_pending = 1;
-	if (alert_task_handle != NULL)
+	TaskHandle_t task_handle = (TaskHandle_t)alert_task_handle;
+
+	if (task_handle != NULL)
 	{
 		BaseType_t xHigherPriorityTaskWoken = pdFALSE;
-		vTaskNotifyGiveFromISR(alert_task_handle, &xHigherPriorityTaskWoken);
+		vTaskNotifyGiveFromISR(task_handle, &xHigherPriorityTaskWoken);
 		portYIELD_FROM_ISR(xHigherPriorityTaskWoken);
 	}
 }
 
-/*
- * 任务中处理告读寄存器+执行回调+清除状
- *
- * 此函数在FreeRTOS任务循环中调处于任务上下* 可以安全地执行I2C操作(互斥锁、GPIO操作
- *
- * 处理流程:
- *   1. 检查volatile标志是否被ISR置位
- *   2. 清除标志
- *   3. 读取SYS_STAT寄存获取具体告警类型
- *   4. 对每个置位的告警标志:
- *      a. 记录到write_value(用于后续清除)
- *      b. 调用对应回调函数(如果已注
- *   5. 将write_value写回SYS_STAT寄存清零)
- *
- * 返回: true=处理了告false=无待处理告警
- *
- * 使用方法:
- *   // 在FreeRTOS任务循环
- *   if (BQ769X0_ProcessAlert())
- *   {
- *       // 告警已处回调已执
- *   }
- */
 #define BQ_SYS_STAT_FAULT_MASK \
     (SYS_STAT_OVRD_BIT | SYS_STAT_UV_BIT | SYS_STAT_OV_BIT | \
      SYS_STAT_SCD_BIT | SYS_STAT_OCD_BIT | SYS_STAT_DEVICE_BIT)
@@ -928,14 +906,7 @@ bool BQ769X0_ProcessAlert(void)
 {
 	uint8_t reg_value = 0;
 
-	/* 检查是否有待处理告ISR中设置的标志) */
-	if (!bq_alert_pending)
-		return false;
-
-	/* 清除标志(在读寄存器之防止新的ISR覆盖) */
-	bq_alert_pending = 0;
-
-	/* 读取SYS_STAT寄存获取具体告警类型 */
+	/* 每次都读取 SYS_STAT；任务的超时轮询负责兜底丢失的边沿通知。 */
 	if (BQ769X0_ReadRegisterByteWithCRC(SYS_STAT, &reg_value) != true)
 	{
 		return false;
@@ -943,7 +914,7 @@ bool BQ769X0_ProcessAlert(void)
 
 	if (reg_value == 0)
 	{
-		return false;
+		return true;
 	}
 
 	/* Handle the real hardware alert and clear SYS_STAT. */
@@ -964,11 +935,15 @@ bool BQ769X0_ProcessAlert(void)
  * 偏移量ADCOFFSET是有符号8位
  *   0x00~0x7F: 正偏0~127)
  *   0x80~0xFF: 负偏-128~-1), 需要减56得到实际*/
-void BQ769X0_GetADCGainOffset(void)
+/* 读取并计算 ADC 增益与偏移；任一寄存器读取失败时返回 false。 */
+static bool BQ769X0_GetADCGainOffset(void)
 {
-	BQ769X0_ReadRegisterByteWithCRC(ADCGAIN1, &(Registers.ADCGain1.ADCGain1Byte));
-	BQ769X0_ReadRegisterByteWithCRC(ADCGAIN2, &(Registers.ADCGain2.ADCGain2Byte));
-	BQ769X0_ReadRegisterByteWithCRC(ADCOFFSET, &(Registers.ADCOffset));
+	if (!BQ769X0_ReadRegisterByteWithCRC(ADCGAIN1, &(Registers.ADCGain1.ADCGain1Byte)) ||
+	    !BQ769X0_ReadRegisterByteWithCRC(ADCGAIN2, &(Registers.ADCGain2.ADCGain2Byte)) ||
+	    !BQ769X0_ReadRegisterByteWithCRC(ADCOFFSET, &(Registers.ADCOffset)))
+	{
+		return false;
+	}
 
 	/* 拼接增益分散在两个寄存器*/
 	Gain = (ADCGAIN_BASE + ((Registers.ADCGain1.ADCGain1Byte & 0x0C) << 1) + ((Registers.ADCGain2.ADCGain2Byte & 0xE0) >> 5)) / 1000.0;
@@ -983,6 +958,8 @@ void BQ769X0_GetADCGainOffset(void)
 	{
 		Adcoffset = Registers.ADCOffset - 256;  /* 负数 */
 	}
+
+	return true;
 }
 
 
@@ -996,9 +973,10 @@ void BQ769X0_GetADCGainOffset(void)
  *
  * 验证方法: 写入后回读全个寄存器,逐字节比* 如果不一致则死循硬件问题,需要检查I2C连接)
  */
-static void BQ769X0_Configuration(void)
+/* 写入并回读验证 BQ 关键配置寄存器。 */
+static bool BQ769X0_Configuration(void)
 {
-	unsigned char ReadBuffer[8];
+	unsigned char ReadBuffer[8] = {0};
 
 	/* 设置寄存器镜*/
 	Registers.SysCtrl1.SysCtrl1Byte = 0x18;  /* ADC使能+外部NTC */
@@ -1006,10 +984,16 @@ static void BQ769X0_Configuration(void)
 	Registers.CCCfg = 0x19;                    /* 库仑计配必须0x19) */
 
 	/* 批量写入8个配置寄存器(SYS_CTRL1 ~ CC_CFG) */
-	BQ769X0_WriteBlockWithCRC(SYS_CTRL1, &(Registers.SysCtrl1.SysCtrl1Byte), 8);
+	if (!BQ769X0_WriteBlockWithCRC(SYS_CTRL1, &(Registers.SysCtrl1.SysCtrl1Byte), 8))
+	{
+		return false;
+	}
 
 	/* 回读验证 */
-	BQ769X0_ReadBlockWithCRC(SYS_CTRL1, ReadBuffer, 8);
+	if (!BQ769X0_ReadBlockWithCRC(SYS_CTRL1, ReadBuffer, 8))
+	{
+		return false;
+	}
 
 	/*
 	 * 逐字节比ReadBuffer[0]需要屏蔽最高位,因为LOAD_PRESENT可能被置
@@ -1025,8 +1009,10 @@ static void BQ769X0_Configuration(void)
 	|| ReadBuffer[7] != Registers.CCCfg)
 	{
 		BQ769X0_ERROR("BQ769X0 config register fail,Please reset BMS board");
-		while (1);  /* 死循需要人工复*/
+		return false;
 	}
+
+	return true;
 }
 
 
@@ -1076,11 +1062,18 @@ void BQ769X0_Wakeup(void)
  *   第二0x01 (设置SHUT_A)
  *   第三0x02 (设置SHUT_B, 完成关机序列)
  */
-void BQ769X0_EntryShip(void)
+/* 按规定序列进入 Ship 模式；三次写入全部成功时返回 true。 */
+bool BQ769X0_EntryShip(void)
 {
-	BQ769X0_WriteRegisterByteWithCRC(SYS_CTRL1, 0x00);
-	BQ769X0_WriteRegisterByteWithCRC(SYS_CTRL1, 0x01);
-	BQ769X0_WriteRegisterByteWithCRC(SYS_CTRL1, 0x02);
+	bool result;
+
+	BQ769X0_BusLock();
+	result = BQ769X0_WriteRegisterByteWithCRC(SYS_CTRL1, 0x00) &&
+	         BQ769X0_WriteRegisterByteWithCRC(SYS_CTRL1, 0x01) &&
+	         BQ769X0_WriteRegisterByteWithCRC(SYS_CTRL1, 0x02);
+	BQ769X0_BusUnlock();
+
+	return result;
 }
 
 /*
@@ -1139,26 +1132,38 @@ out:
  * 注意: BQ769X0不允许相邻电芯同时均硬件限制)
  *       上层BMS需要做冲突过滤,本函数只负责写寄存器
  */
-void BQ769X0_CellBalanceControl(BQ769X0_CellIndexTypedef CellIndex, BQ769X0_StateTypedef NewState)
+/* 更新电芯均衡位图；写入并回读一致后才提交软件镜像。 */
+bool BQ769X0_CellBalanceControl(BQ769X0_CellIndexTypedef CellIndex, BQ769X0_StateTypedef NewState)
 {
-	static uint8_t CELL_BAL_VALUE[3] = {0};
+	uint8_t next_value[3];
+	uint8_t read_value[3] = {0};
+	bool result = false;
 
 	BQ769X0_BusLock();
+	memcpy(next_value, s_cell_balance_value, sizeof(next_value));
 	if (NewState == BQ_STATE_ENABLE)
 	{
-		CELL_BAL_VALUE[0] |= CellIndex & 0x1F;
-		CELL_BAL_VALUE[1] |= (CellIndex >> 5) & 0x1F;
-		CELL_BAL_VALUE[2] |= (CellIndex >> 10) & 0x1F;
+		next_value[0] |= CellIndex & 0x1F;
+		next_value[1] |= (CellIndex >> 5) & 0x1F;
+		next_value[2] |= (CellIndex >> 10) & 0x1F;
 	}
 	else if (NewState == BQ_STATE_DISABLE)
 	{
-		CELL_BAL_VALUE[0] &= ~(CellIndex & 0x1F);
-		CELL_BAL_VALUE[1] &= ~((CellIndex >> 5) & 0x1F);
-		CELL_BAL_VALUE[2] &= ~((CellIndex >> 10) & 0x1F);
+		next_value[0] &= (uint8_t)~(CellIndex & 0x1F);
+		next_value[1] &= (uint8_t)~((CellIndex >> 5) & 0x1F);
+		next_value[2] &= (uint8_t)~((CellIndex >> 10) & 0x1F);
 	}
 
-	BQ769X0_WriteBlockWithCRC(CELLBAL1, CELL_BAL_VALUE, 3);
+	if (BQ769X0_WriteBlockWithCRC(CELLBAL1, next_value, 3) &&
+	    BQ769X0_ReadBlockWithCRC(CELLBAL1, read_value, 3) &&
+	    (memcmp(next_value, read_value, sizeof(next_value)) == 0))
+	{
+		memcpy(s_cell_balance_value, next_value, sizeof(s_cell_balance_value));
+		result = true;
+	}
 	BQ769X0_BusUnlock();
+
+	return result;
 }
 
 
@@ -1305,27 +1310,27 @@ uint8_t BQ769X0_VerifyRegisterCRC(uint8_t reg_addr, const char *reg_name)
 }
 
 
-/*==========================================================================
- * BQ769X0初始化函*
- * 完整的初始化流程:
- *   1. 进入Ship模式(相当于软复位,清除芯片所有状
- *   2. 等待500ms
- *   3. 唤醒芯片(TS1高电平脉
- *   4. 读取ADC校准增益和偏*   5. 保存上层注册的报警回*   6. 配置保护参数(阈值和延时)
- *   7. 计算OV/UV阈值寄存器*   8. 写入配置寄存器并验证
- *
- * 参数: InitData - 包含保护配置和报警回*
- * 注意: 配置寄存器回读验证失败时会死循环(while(1))
- *       这通常意味着I2C通信有问需要检查硬件连*========================================================================*/
-void BQ769X0_Initialize(BQ769X0_InitDataTypedef *InitData)
+/* 完成 BQ 初始化；任一步通信或配置验证失败时返回 false。 */
+bool BQ769X0_Initialize(const BQ769X0_InitDataTypedef *InitData)
 {
+	if (InitData == NULL)
+	{
+		return false;
+	}
+
 	/* 步骤1~3: 复位并唤醒BQ芯片 */
-	BQ769X0_EntryShip();
+	if (!BQ769X0_EntryShip())
+	{
+		return false;
+	}
 	BQ769X0_DELAY(500);
 	BQ769X0_Wakeup();
 
 	/* 步骤4: 读取ADC校准每个芯片不同,出厂时写*/
-	BQ769X0_GetADCGainOffset();
+	if (!BQ769X0_GetADCGainOffset())
+	{
+		return false;
+	}
 
 	/* 步骤5: 保存报警回调(上层BMS注册的处理函*/
 	AlertOps = InitData->AlertOps;
@@ -1345,32 +1350,53 @@ void BQ769X0_Initialize(BQ769X0_InitDataTypedef *InitData)
 	Registers.UVTrip = (uint8_t)((((uint16_t)((InitData->ConfigData.UVPThreshold - Adcoffset) / Gain) - UV_THRESH_BASE) >> 4) & 0xFF);
 
 	/* 步骤8: 写入配置并验*/
-	BQ769X0_Configuration();
+	if (!BQ769X0_Configuration())
+	{
+		return false;
+	}
 
 	BQ769X0_INFO("BQ769X0 Initialize successful!");
+	return true;
 }
 
 /* ==========================================================================
  * 通用安全关闭：断开 CHG/DSG 并清零均衡
  * ========================================================================== */
 
-void BQ769X0_ForceSafeOff(void)
+/* 有界重试关闭充放电 MOS 并清零均衡，回读全部正确时返回 true。 */
+bool BQ769X0_ForceSafeOff(uint8_t retry_count)
 {
-	uint8_t ctrl2_val = 0;
+	static const uint8_t safe_ctrl2 = 0x40U;
+	static const uint8_t balance_off[3] = {0U, 0U, 0U};
+	uint8_t ctrl2_read = 0;
+	uint8_t balance_read[3] = {0};
+	uint8_t attempt;
+	bool result = false;
 
-	BQ769X0_BusLock();
-	if (BQ769X0_ReadRegisterByteWithCRC(SYS_CTRL2, &ctrl2_val))
+	if (retry_count == 0U)
 	{
-		uint8_t write_val = ctrl2_val & ~(CHG_CONTROL | DSG_CONTROL);
-		if (BQ769X0_WriteRegisterByteWithCRC(SYS_CTRL2, write_val))
-		{
-			Registers.SysCtrl2.SysCtrl2Byte = write_val;
-		}
+		return false;
 	}
 
-	uint8_t bal_write[3] = {0, 0, 0};
-	BQ769X0_WriteBlockWithCRC(CELLBAL1, bal_write, 3);
+	BQ769X0_BusLock();
+	for (attempt = 0U; attempt < retry_count; attempt++)
+	{
+		if (BQ769X0_WriteRegisterByteWithCRC(SYS_CTRL2, safe_ctrl2) &&
+		    BQ769X0_WriteBlockWithCRC(CELLBAL1, balance_off, 3U) &&
+		    BQ769X0_ReadRegisterByteWithCRC(SYS_CTRL2, &ctrl2_read) &&
+		    BQ769X0_ReadBlockWithCRC(CELLBAL1, balance_read, 3U) &&
+		    ((ctrl2_read & (CHG_CONTROL | DSG_CONTROL)) == 0U) &&
+		    (memcmp(balance_read, balance_off, sizeof(balance_off)) == 0))
+		{
+			Registers.SysCtrl2.SysCtrl2Byte = ctrl2_read;
+			memcpy(s_cell_balance_value, balance_off, sizeof(s_cell_balance_value));
+			result = true;
+			break;
+		}
+	}
 	BQ769X0_BusUnlock();
+
+	return result;
 }
 
 /* ==========================================================================

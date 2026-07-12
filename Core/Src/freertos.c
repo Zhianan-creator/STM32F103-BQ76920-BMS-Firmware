@@ -32,6 +32,8 @@
 #include "bms_uart_cmd.h"
 #include "bms_can_task.h"
 #include "bms_protect.h"
+#include "bms_config.h"
+#include "bms_hal_watchdog.h"
 #include <stdio.h>
 
 /* USER CODE END Includes */
@@ -69,12 +71,13 @@ const osThreadAttr_t alertTask_attributes = {
 };
 
 osThreadId_t bmsCanTaskHandle;
+static volatile uint8_t criticalTasksReady;
 /* USER CODE END Variables */
 /* Definitions for defaultTask */
 osThreadId_t defaultTaskHandle;
 const osThreadAttr_t defaultTask_attributes = {
   .name = "defaultTask",
-  .stack_size = 128 * 4,
+  .stack_size = 256 * 4,
   .priority = (osPriority_t) osPriorityNormal,
 };
 
@@ -95,6 +98,11 @@ void MX_FREERTOS_Init(void); /* (MISRA C 2004 rule 8.1) */
   */
 void MX_FREERTOS_Init(void) {
   /* USER CODE BEGIN Init */
+
+  if (!BMS_InitPrepare())
+  {
+    printf("[RTOS] ERROR: init event create failed\r\n");
+  }
 
   /* USER CODE END Init */
 
@@ -120,9 +128,14 @@ void MX_FREERTOS_Init(void) {
 
   /* USER CODE BEGIN RTOS_THREADS */
   /* add threads, ... */
-  /* BQ769X0 周期采样与中断处理任(手动放入 USER CODE 区域防止CubeMX 覆盖) */
   sampleTaskHandle = osThreadNew(BMS_SampleTask, NULL, &sampleTask_attributes);
   alertTaskHandle = osThreadNew(BMS_AlertTask, NULL, &alertTask_attributes);
+  criticalTasksReady = ((defaultTaskHandle != NULL) && (sampleTaskHandle != NULL) &&
+                        (alertTaskHandle != NULL)) ? 1U : 0U;
+  if (!criticalTasksReady)
+  {
+    printf("[RTOS] ERROR: critical task create failed\r\n");
+  }
 
 #if (BMS_UART_CMD_ENABLE != 0)
   extern const osThreadAttr_t uartCmdTask_attributes;
@@ -156,12 +169,42 @@ void MX_FREERTOS_Init(void) {
 void StartDefaultTask(void *argument)
 {
   /* USER CODE BEGIN StartDefaultTask */
+  uint32_t last_progress;
+  int init_status;
 
-  BMS_InitRun();
+  (void)argument;
+  init_status = BMS_InitRun();
+  if (!criticalTasksReady)
+  {
+    for (;;)
+    {
+      osDelay(BMS_WATCHDOG_SUPERVISOR_MS);
+    }
+  }
+
+  if ((init_status == 0) &&
+      BMS_HAL_WatchdogSetTimeout(BMS_WATCHDOG_RUNTIME_TIMEOUT_MS))
+  {
+    last_progress = BMS_SampleTaskGetProgress();
+    BMS_HAL_WatchdogRefresh();
+
+    for (;;)
+    {
+      uint32_t progress;
+
+      osDelay(BMS_WATCHDOG_SUPERVISOR_MS);
+      progress = BMS_SampleTaskGetProgress();
+      if (progress != last_progress)
+      {
+        last_progress = progress;
+        BMS_HAL_WatchdogRefresh();
+      }
+    }
+  }
 
   for (;;)
   {
-    osDelay(1000);
+    osDelay(BMS_WATCHDOG_SUPERVISOR_MS);
   }
 
   /* USER CODE END StartDefaultTask */

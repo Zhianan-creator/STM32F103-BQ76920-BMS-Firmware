@@ -40,6 +40,8 @@
 #define BMS_CAN_FAULT_SCD          0x08U
 #define BMS_CAN_FAULT_ANY          0x10U
 #define BMS_CAN_FAULT_MON_INVALID  0x20U
+#define BMS_CAN_FAULT_OCC          0x40U
+#define BMS_CAN_FAULT_TEMP         0x80U
 
 /*
  * CAN 接收帧缓存。
@@ -474,6 +476,15 @@ static uint8_t BMS_CAN_BuildFaultFlags(const BMS_MonitorData_t *mon,
         if (prot->any_active)
         {
             flags |= BMS_CAN_FAULT_ANY;
+        }
+        if (prot->occ_active)
+        {
+            flags |= BMS_CAN_FAULT_OCC;
+        }
+        if (prot->otc_active || prot->otd_active ||
+            prot->ltc_active || prot->ltd_active)
+        {
+            flags |= BMS_CAN_FAULT_TEMP;
         }
     }
 

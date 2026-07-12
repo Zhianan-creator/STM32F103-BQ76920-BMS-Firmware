@@ -3,103 +3,154 @@
 
 #include <stdint.h>
 
-/* BMS 保护类型枚举 */
+/* BMS 软件保护故障类型。 */
 typedef enum
 {
     BMS_PROTECT_FAULT_NONE = 0,
     BMS_PROTECT_FAULT_OV,
     BMS_PROTECT_FAULT_UV,
     BMS_PROTECT_FAULT_OCD,
-    BMS_PROTECT_FAULT_SCD
+    BMS_PROTECT_FAULT_SCD,
+    BMS_PROTECT_FAULT_OCC,
+    BMS_PROTECT_FAULT_OTC,
+    BMS_PROTECT_FAULT_OTD,
+    BMS_PROTECT_FAULT_LTC,
+    BMS_PROTECT_FAULT_LTD,
+    BMS_PROTECT_FAULT_MONITOR
 } BMS_ProtectFault_t;
 
-/* BMS 保护状态标志结构体 */
+/* BMS 软件保护状态。 */
 typedef struct
 {
-    /* 1. 单项保护状*/
-    uint8_t ov_active;   /* 过压保护激活状(1=触发, 0=未触*/
-    uint8_t uv_active;   /* 欠压保护激活状(1=触发, 0=未触*/
-    uint8_t ocd_active;  /* 放电过流保护激活状(1=触发, 0=未触*/
-    uint8_t scd_active;  /* 短路保护激活状(1=触发, 0=未触*/
+    uint8_t ov_active;
+    uint8_t uv_active;
+    uint8_t ocd_active;
+    uint8_t scd_active;
+    uint8_t occ_active;
+    uint8_t otc_active;
+    uint8_t otd_active;
+    uint8_t ltc_active;
+    uint8_t ltd_active;
+    uint8_t fail_safe_active;
+    uint8_t safe_off_confirmed;
+    uint8_t shutdown_active;
+    uint8_t output_safe_confirmed;
 
-    /* 2. 单项挂起(延迟确认)状*/
-    uint8_t ov_pending;  /* 过压保护挂起状(1=正在延迟确认, 0=否*/
-    uint8_t uv_pending;  /* 欠压保护挂起状(1=正在延迟确认, 0=否*/
-    uint8_t ocd_pending; /* 放电过流保护挂起状(1=正在延迟确认, 0=否*/
-    uint8_t scd_pending; /* 短路保护挂起状(1=正在延迟确认, 0=否*/
+    uint8_t ov_pending;
+    uint8_t uv_pending;
+    uint8_t ocd_pending;
+    uint8_t scd_pending;
+    uint8_t occ_pending;
+    uint8_t otc_pending;
+    uint8_t otd_pending;
+    uint8_t ltc_pending;
+    uint8_t ltd_pending;
 
-    /* 3. 总保护状*/
-    uint8_t any_active;  /* 任何保护是否被激*/
+    uint8_t any_active;
+    uint8_t charge_allowed;
+    uint8_t discharge_allowed;
 
-    /* 3. 允许状*/
-    uint8_t charge_allowed;    /* 允许充电 */
-    uint8_t discharge_allowed; /* 允许放电 */
+    BMS_ProtectFault_t last_fault;
+    uint8_t last_fault_cell;
+    int32_t last_fault_value;
 
-    /* 4. 最近一次触发信*/
-    BMS_ProtectFault_t last_fault; /* 最近一次故障类*/
-    uint8_t last_fault_cell;       /* 最近一次故障电芯编(1-indexed, 0表示无或不适用) */
-    uint32_t last_fault_value;     /* 最近一次故障触发(mV mA) */
-
-    /* 5. 统计信息 */
-    uint32_t ov_trigger_count;  /* 过压触发次数 */
-    uint32_t uv_trigger_count;  /* 欠压触发次数 */
-    uint32_t ocd_trigger_count; /* 放电过流触发次数 */
-    uint32_t scd_trigger_count; /* 短路触发次数 */
+    uint32_t ov_trigger_count;
+    uint32_t uv_trigger_count;
+    uint32_t ocd_trigger_count;
+    uint32_t scd_trigger_count;
+    uint32_t occ_trigger_count;
+    uint32_t otc_trigger_count;
+    uint32_t otd_trigger_count;
+    uint32_t ltc_trigger_count;
+    uint32_t ltd_trigger_count;
+    uint32_t fail_safe_trigger_count;
 } BMS_ProtectState_t;
 
-/* 初始化保护状态变*/
+/* 初始化保护阈值、计时器和状态。 */
 void BMS_ProtectInit(void);
 
-/* 根据 Monitor 电参数据更新保护状态机 */
+/* 根据最新监控数据更新全部软件保护，并执行必要的安全关断。 */
 void BMS_ProtectUpdateFromMonitor(void);
 
-/* 获取当前保护状态结构体常量指针 */
+/* 锁存已进入 Ship 模式的终止状态，禁止后续重新开启 MOS。 */
+void BMS_ProtectLatchShutdown(void);
+
+/* 获取当前保护状态的只读指针。 */
 const BMS_ProtectState_t *BMS_ProtectGetState(void);
 
-/* 查询是否有任何保护被激*/
+/* 查询是否存在任一激活的保护。 */
 uint8_t BMS_ProtectIsAnyActive(void);
 
-/* 查询过压保护状*/
+/* 查询单体过压保护是否激活。 */
 uint8_t BMS_ProtectIsOvActive(void);
 
-/* 查询欠压保护状*/
+/* 查询单体欠压保护是否激活。 */
 uint8_t BMS_ProtectIsUvActive(void);
 
-/* 查询放电过流保护状*/
+/* 查询放电过流保护是否激活。 */
 uint8_t BMS_ProtectIsOcdActive(void);
 
-/* 查询短路保护状*/
+/* 查询放电短路保护是否激活。 */
 uint8_t BMS_ProtectIsScdActive(void);
 
-/* 查询是否允许充电 */
+/* 查询当前是否允许充电。 */
 uint8_t BMS_ProtectIsChargeAllowed(void);
 
-/* 查询是否允许放电 */
+/* 查询当前是否允许放电。 */
 uint8_t BMS_ProtectIsDischargeAllowed(void);
 
-/* 获取最近一次触发故*/
+/* 获取最近一次触发的保护类型。 */
 BMS_ProtectFault_t BMS_ProtectGetLastFault(void);
 
-/* 将保护类型转换为字符*/
+/* 将保护类型转换为便于日志显示的字符串。 */
 const char *BMS_ProtectFaultToString(BMS_ProtectFault_t fault);
 
-/* 动态保护阈值及延时获取/修改函数 */
+/* 设置单体过压阈值，单位为毫伏。 */
 void BMS_ProtectSetOVMv(int ov_mv);
+
+/* 设置单体欠压阈值，单位为毫伏。 */
 void BMS_ProtectSetUVMv(int uv_mv);
+
+/* 设置放电过流阈值，单位为毫安。 */
 void BMS_ProtectSetOCDMa(int ocd_ma);
+
+/* 设置放电短路阈值，单位为毫安。 */
 void BMS_ProtectSetSCDMa(int scd_ma);
+
+/* 设置单体过压确认延时，单位为毫秒。 */
 void BMS_ProtectSetOVDelayMs(int delay_ms);
+
+/* 设置单体欠压确认延时，单位为毫秒。 */
 void BMS_ProtectSetUVDelayMs(int delay_ms);
+
+/* 设置放电过流确认延时，单位为毫秒。 */
 void BMS_ProtectSetOCDDelayMs(int delay_ms);
+
+/* 设置放电短路确认延时，单位为毫秒。 */
 void BMS_ProtectSetSCDDelayMs(int delay_ms);
 
+/* 获取单体过压阈值，单位为毫伏。 */
 int BMS_ProtectGetOVMv(void);
+
+/* 获取单体欠压阈值，单位为毫伏。 */
 int BMS_ProtectGetUVMv(void);
+
+/* 获取放电过流阈值，单位为毫安。 */
 int BMS_ProtectGetOCDMa(void);
+
+/* 获取放电短路阈值，单位为毫安。 */
 int BMS_ProtectGetSCDMa(void);
+
+/* 获取单体过压确认延时，单位为毫秒。 */
 int BMS_ProtectGetOVDelayMs(void);
+
+/* 获取单体欠压确认延时，单位为毫秒。 */
 int BMS_ProtectGetUVDelayMs(void);
+
+/* 获取放电过流确认延时，单位为毫秒。 */
 int BMS_ProtectGetOCDDelayMs(void);
+
+/* 获取放电短路确认延时，单位为毫秒。 */
 int BMS_ProtectGetSCDDelayMs(void);
 
 #endif /* BMS_PROTECT_H */

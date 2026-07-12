@@ -11,8 +11,8 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-#ifndef __BMS_CONFIG_H__
-#define __BMS_CONFIG_H__
+#ifndef BMS_CONFIG_H
+#define BMS_CONFIG_H
 
 
 
@@ -90,9 +90,7 @@
 #define INIT_SHUTDOWN_VOLTAGE	TLB_SHUTDOWN_VOLTAGE	// 自动关机电压(V),暂未使用,预留
 #define INIT_BALANCE_VOLTAGE	TLB_BALANCE_VOLTAGE		// 均衡起始电压(V)
 
-#define INIT_BALANCE_CURRENT_MAX	0.6		// 最大均衡电A),暂未使用,预留
-#define	INIT_OCC_MAX				2.2		// 最大充电电A)
-#define	INIT_OCD_MAX				2.2		// 最大放电电A),由BQ芯片控制,此参数改动不起作应该在drv_softi2c_bq769x0.c修改放电过流
+#define INIT_BALANCE_CURRENT_MAX	0.6		// 最大均衡电流(A)，预留
 
 // 放电过流保护阈mA),用于软件层保护判
 // 2200mA 对应 2.2A, INIT_OCD_MAX 一
@@ -106,25 +104,36 @@
 #define INIT_UV_DELAY 		BMS_UV_DELAY_4s		// 放电欠压保护延时时间 UV:Under Voltage
 
 #define INIT_OCD_DELAY		BMS_OCD_DELAY_320ms // 放电过流延时时间(S) OCD:Over Current Discharge
-#define INIT_OCD_RELIEVE	60					// 放电过流解除时间(S)
-
 #define INIT_SCD_DELAY		BMS_SCD_DELAY_100us	// 放电短路延时时间(us) SCD:Short Circuit Discharge
-#define INIT_SCD_RELIEVE	60					// 放电短路解除时间(S)
 
-#define INIT_OCC_DELAY		1		// 充电过流延时时间(S) OCC:Over Current Charge
-#define INIT_OCC_RELIEVE	60		// 充电过流解除时间(S)
+/* 软件充电过流保护：电流单位为 mA，时间单位为 ms。 */
+#define INIT_OCC_PROTECT_MA          2200
+#define INIT_OCC_RELEASE_MA          2000
+#define INIT_OCC_DELAY_MS            1000U
+#define INIT_OCC_RECOVERY_MS        60000U
 
-#define INIT_OTC_PROTECT	70		// 充电过温保护( OTC:Over Temperature Charge
-#define INIT_OTC_RELIEVE	60		// 充电过温解除(
+/* 三元锂温度保护默认值，量产前应按实际电芯规格复核。 */
+#define INIT_OTC_PROTECT_C             45
+#define INIT_OTC_RELEASE_C             40
+#define INIT_OTD_PROTECT_C             60
+#define INIT_OTD_RELEASE_C             55
+#define INIT_LTC_PROTECT_C              0
+#define INIT_LTC_RELEASE_C              5
+#define INIT_LTD_PROTECT_C            (-20)
+#define INIT_LTD_RELEASE_C            (-15)
+#define INIT_TEMP_DELAY_MS           2000U
+#define INIT_TEMP_RECOVERY_MS        5000U
 
-#define INIT_OTD_PROTECT	70		// 放电过温保护( OTD:Over Temperature Discharge
-#define INIT_OTD_RELIEVE	60		// 放电过温解除(
-
-#define INIT_LTC_PROTECT	-20		// 充电低温保护( LTC:Low Temperature Charge
-#define INIT_LTC_RELIEVE	-10		// 充电低温解除(
-
-#define INIT_LTD_PROTECT	-20		// 放电低温保护( LTD:Low Temperature Discharge
-#define INIT_LTD_RELIEVE	-10		// 放电低温解除(
+/* 运行安全与恢复参数。 */
+#define BMS_MONITOR_FAIL_SAFE_COUNT     3U
+#define BMS_MONITOR_RECOVERY_COUNT      3U
+#define BMS_SAFE_OFF_RETRY_COUNT        3U
+#define BMS_ALERT_POLL_MS             500U
+#define BMS_INIT_RETRY_COUNT            3U
+#define BMS_INIT_RETRY_DELAY_MS       500U
+#define BMS_WATCHDOG_BOOT_TIMEOUT_MS 25000U
+#define BMS_WATCHDOG_RUNTIME_TIMEOUT_MS 6000U
+#define BMS_WATCHDOG_SUPERVISOR_MS    1000U
 
 
 
@@ -145,6 +154,6 @@
 /*************************************************************************************/
 
 
-#endif
+#endif /* BMS_CONFIG_H */
 
 

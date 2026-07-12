@@ -828,6 +828,16 @@
               <FileType>5</FileType>
               <FilePath>..\User\Bms\Hal\bms_hal_config.h</FilePath>
             </File>
+            <File>
+              <FileName>bms_hal_watchdog.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>..\User\Bms\Hal\bms_hal_watchdog.c</FilePath>
+            </File>
+            <File>
+              <FileName>bms_hal_watchdog.h</FileName>
+              <FileType>5</FileType>
+              <FilePath>..\User\Bms\Hal\bms_hal_watchdog.h</FilePath>
+            </File>
           </Files>
         </Group>
         <Group>

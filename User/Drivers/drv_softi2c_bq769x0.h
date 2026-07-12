@@ -18,8 +18,8 @@
  *									(2)修改了开路电压计算函数使之过程更清晰
  * 2022-7-2       逍遥吾皇          去掉查表方法,更新热敏电阻计算公式
  * 2023-1-5       逍遥吾皇          去掉了BQ769X0驱动的动态内存分*/
-#ifndef __DRV_SOFTI2C_BQ769X0_H__
-#define __DRV_SOFTI2C_BQ769X0_H__
+#ifndef DRV_SOFTI2C_BQ769X0_H
+#define DRV_SOFTI2C_BQ769X0_H
 
 #include <stdio.h>
 #include <string.h>
@@ -849,33 +849,37 @@ extern BQ769X0_SampleDataTypedef BQ769X0_SampleData;
  * BQ769X0公开接口函数声明
  *========================================================================*/
 
-/* 底层 I2C 寄存器读写入 API（支CRC 校验*/
-bool BQ769X0_WriteBlockWithCRC(uint8_t startAddress, uint8_t *buffer, uint8_t length);
+/* 连续写入带 CRC 的寄存器数据块。 */
+bool BQ769X0_WriteBlockWithCRC(uint8_t startAddress, const uint8_t *buffer, uint8_t length);
+
+/* 读取一个带 CRC 的寄存器字节。 */
 bool BQ769X0_ReadRegisterByteWithCRC(uint8_t Register, uint8_t *data);
+
+/* 连续读取带 CRC 的寄存器数据块。 */
 bool BQ769X0_ReadBlockWithCRC(uint8_t Register, uint8_t *buffer, uint8_t length);
 
-/*
- * BQ芯片初始- 必须在I2C_BusInitialize()之后调用
- * 功能: 唤醒芯片 -> 读取ADC增益/偏移 -> 配置保护参数 -> 验证寄存* 参数: InitData - 初始化数保护配置+报警回调)
- * 注意: 配置寄存器回读验证失败时会死循环(while(1)),需要检查硬件连*/
-void BQ769X0_Initialize(BQ769X0_InitDataTypedef *InitData);
+/* 初始化 BQ769X0，并完成唤醒、校准参数读取和保护寄存器配置。 */
+bool BQ769X0_Initialize(const BQ769X0_InitDataTypedef *InitData);
 
 /*
  * 唤醒BQ芯片(从Ship模式)
  * 原理: 在TS1引脚输出高电平脉冲(至少1s), 然后切回输入模式
  */
+/* 通过 TS1 引脚唤醒处于 Ship 模式的 BQ769X0。 */
 void BQ769X0_Wakeup(void);
 
 /*
  * 进入Ship模式(超低功
  * 功能: 按照数据手册的序列写入SYS_CTRL1寄存* 注意: 进入Ship后需要通过TS1引脚唤醒
  */
-void BQ769X0_EntryShip(void);
+/* 按数据手册规定的写入序列使 BQ769X0 进入 Ship 模式。 */
+bool BQ769X0_EntryShip(void);
 
 /*
  * 负载检* 返回: true=检测到负载, false=未检测到
  * 条件: 充电MOS关闭(CHG_ON=0)且LOAD_PRESENT标志置位
  */
+/* 检测充电 MOS 关闭时是否存在负载。 */
 bool BQ769X0_LoadDetect(void);
 
 /*
@@ -883,6 +887,7 @@ bool BQ769X0_LoadDetect(void);
  *   ControlType - CHG_CONTROL(充电) 或 DSG_CONTROL(放电)
  *   NewState    - BQ_STATE_ENABLE(开) 或 BQ_STATE_DISABLE(关)
  */
+/* 控制充电或放电 MOS，并返回寄存器写入及回读结果。 */
 bool BQ769X0_ControlDSGOrCHG(BQ769X0_ControlTypedef ControlType, BQ769X0_StateTypedef NewState);
 
 /*
@@ -892,62 +897,65 @@ bool BQ769X0_ControlDSGOrCHG(BQ769X0_ControlTypedef ControlType, BQ769X0_StateTy
  *   NewState  - BQ_STATE_ENABLE(开启均BQ_STATE_DISABLE(关闭均衡)
  * 注意: 芯片不允许相邻电芯同时均上层需要做冲突过滤
  */
-void BQ769X0_CellBalanceControl(BQ769X0_CellIndexTypedef CellIndex, BQ769X0_StateTypedef NewState);
+/* 控制指定电芯均衡，并通过回读确认控制结果。 */
+bool BQ769X0_CellBalanceControl(BQ769X0_CellIndexTypedef CellIndex, BQ769X0_StateTypedef NewState);
 
-/* 周期性采样函在任务中调用) */
-void BQ769X0_UpdateCellVolt(void);   /* 更新电芯电压(建议250ms周期) */
-void BQ769X0_UpdateTsTemp(void);     /* 更新热敏电阻温度(建议2s周期) */
-void BQ769X0_UpdateDieTemp(void);    /* 更新IC内部温度(未验*/
-void BQ769X0_UpdateCurrent(void);    /* 更新电池电流(建议250ms周期) */
-void BQ769X0_UpadteBatVolt(void);    /* 更新电池总电建议250ms周期) */
+/* 更新全部电芯电压，通信失败时保留旧值并返回 false。 */
+bool BQ769X0_UpdateCellVolt(void);
 
-/* 保护参数运行时修改函*/
+/* 更新外部温度传感器数据，通信或数据异常时返回 false。 */
+bool BQ769X0_UpdateTsTemp(void);
+
+/* 更新芯片内部温度。 */
+void BQ769X0_UpdateDieTemp(void);
+
+/* 更新电池电流，通信失败时保留旧值并返回 false。 */
+bool BQ769X0_UpdateCurrent(void);
+
+/* 更新电池包总电压，通信失败时保留旧值并返回 false。 */
+bool BQ769X0_UpadteBatVolt(void);
+
+/* 设置硬件放电短路保护延时。 */
 void BQ769X0_SCDDelaySet(BQ769X0_SCDDelayTypedef SCDDelay);
+
+/* 设置硬件放电过流保护延时。 */
 void BQ769X0_OCDDelaySet(BQ769X0_OCDDelayTypedef OCDDelay);
+
+/* 设置硬件欠压保护延时。 */
 void BQ769X0_UVDelaySet(BQ769X0_UVDelayTypedef UVDelay);
+
+/* 设置硬件过压保护延时。 */
 void BQ769X0_OVDelaySet(BQ769X0_OVDelayTypedef OVDelay);
+
+/* 设置硬件欠压保护阈值，单位为毫伏。 */
 void BQ769X0_UVPThresholdSet(uint16_t UVPThreshold);
+
+/* 设置硬件过压保护阈值，单位为毫伏。 */
 void BQ769X0_OVPThresholdSet(uint16_t OVPThreshold);
 
+/* 获取硬件放电短路保护延时。 */
 BQ769X0_SCDDelayTypedef BQ769X0_SCDDelayGet(void);
+
+/* 获取硬件放电过流保护延时。 */
 BQ769X0_OCDDelayTypedef BQ769X0_OCDDelayGet(void);
+
+/* 获取硬件欠压保护延时。 */
 BQ769X0_UVDelayTypedef BQ769X0_UVDelayGet(void);
+
+/* 获取硬件过压保护延时。 */
 BQ769X0_OVDelayTypedef BQ769X0_OVDelayGet(void);
+
+/* 获取硬件欠压保护阈值，单位为毫伏。 */
 uint16_t BQ769X0_UVPThresholdGet(void);
+
+/* 获取硬件过压保护阈值，单位为毫伏。 */
 uint16_t BQ769X0_OVPThresholdGet(void);
 
 
-/*==========================================================================
- * FreeRTOS适配: 告警处理接口
- *
- * 原RT-Thread版本在HAL_GPIO_EXTI_Callback中直接调用BQ769X0_AlertyHandler(),
- * 该函数会读写I2C寄存器。但在FreeRTOSISR不能执行I2C操作(互斥锁、HAL_GPIO_Init
- * 都不能在中断中使用
- * 解决方案: "ISR设置标志 + 任务处理"
- *   1. ISR BQ769X0_AlertNotifyFromISR() 仅设置volatile标志
- *   2. 任务BQ769X0_ProcessAlert() 检查标读取寄存执行回调
- *
- * 使用方法:
- *   // 在FreeRTOS任务循环
- *   if (BQ769X0_ProcessAlert())
- *   {
- *       // 处理了告读取了SYS_STAT,执行了回清除了状态位)
- *   }
- *========================================================================*/
-
-/*
- * 从ISR中通知有告警事* 功能: 仅设置volatile标志不做任何I2C操作
- * 调用位置: HAL_GPIO_EXTI_Callback() 中断上下
- * 注意: 此函数可以在ISR中安全调仅写一个volatile变量)
- */
+/* 从 EXTI ISR 向 ALERT 任务发送通知，不在中断中执行 I2C。 */
 void BQ769X0_AlertNotifyFromISR(void);
 
-/*
- * 在任务中处理告警
- * 功能: 检查告警标-> 读取SYS_STAT -> 调用对应回调 -> 清除状态位
- * 返回: true=处理了告false=无待处理告警
- * 调用位置: FreeRTOS任务循环任务上下
- * 注意: 此函数只能在任务中调禁止在ISR中调*/
+/* 在任务上下文读取、分发并清除 SYS_STAT 告警状态。 */
 bool BQ769X0_ProcessAlert(void);
 
 
@@ -968,23 +976,34 @@ bool BQ769X0_ProcessAlert(void);
  * 返回: 1=CRC通过, 0=CRC失败或通信失败
  *
  * 注意: 此函数仅用于调试验证,正式代码中不需要调*/
+/* 调试读取指定寄存器并验证其 CRC。 */
 uint8_t BQ769X0_VerifyRegisterCRC(uint8_t reg_addr, const char *reg_name);
 
+/* 注册接收 ALERT 任务通知的 FreeRTOS 任务句柄。 */
 void BQ769X0_RegisterAlertTask(TaskHandle_t task_handle);
 
+/* 获取指定电芯的最新电压，单位为毫伏。 */
 uint16_t BQ769X0_GetCellVoltageMv(uint8_t index);
+
+/* 获取最新电池包总电压，单位为毫伏。 */
 uint16_t BQ769X0_GetPackVoltageMv(void);
+
+/* 获取最新电池电流，单位为毫安，正值表示充电。 */
 int32_t BQ769X0_GetCurrentMa(void);
+
+/* 获取指定温度通道的最新温度，单位为摄氏度。 */
 int16_t BQ769X0_GetTemperatureC(uint8_t index);
 
-/* 通用安全关闭：断开 CHG/DSG 并清零均*/
-void BQ769X0_ForceSafeOff(void);
+/* 重试关闭 CHG、DSG 和全部均衡，并通过寄存器回读确认安全状态。 */
+bool BQ769X0_ForceSafeOff(uint8_t retry_count);
 
-/* BQ 总线互斥锁初始化（在 BQ 初始化前调用*/
-void BQ769X0_BusLockInit(void);
+/* 初始化 BQ 总线互斥锁，重复调用不会重复创建。 */
+bool BQ769X0_BusLockInit(void);
 
-/* BQ 总线互斥锁获释放（供需要跨多次寄存器操作保持原子性的上层使用*/
+/* 获取 BQ 总线互斥锁，用于保护一组连续寄存器操作。 */
 void BQ769X0_BusLock(void);
+
+/* 释放 BQ 总线互斥锁。 */
 void BQ769X0_BusUnlock(void);
 
 #endif

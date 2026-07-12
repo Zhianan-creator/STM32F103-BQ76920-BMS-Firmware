@@ -174,6 +174,21 @@ void TIM4_IRQHandler(void)
   /* USER CODE END TIM4_IRQn 1 */
 }
 
+/* 处理 PB12 所在的 EXTI10~15 共用中断。 */
+/**
+  * @brief This function handles EXTI line[15:10] interrupts.
+  */
+void EXTI15_10_IRQHandler(void)
+{
+  /* USER CODE BEGIN EXTI15_10_IRQn 0 */
+
+  /* USER CODE END EXTI15_10_IRQn 0 */
+  HAL_GPIO_EXTI_IRQHandler(GPIO_PIN_12);
+  /* USER CODE BEGIN EXTI15_10_IRQn 1 */
+
+  /* USER CODE END EXTI15_10_IRQn 1 */
+}
+
 /* USER CODE BEGIN 1 */
 /**
   * @brief This function handles USB low priority or CAN1 RX0 interrupts.
@@ -181,14 +196,6 @@ void TIM4_IRQHandler(void)
 void USB_LP_CAN1_RX0_IRQHandler(void)
 {
   HAL_CAN_IRQHandler(&hcan);
-}
-
-/**
-  * @brief This function handles EXTI line[15:10] interrupts.
-  */
-void EXTI15_10_IRQHandler(void)
-{
-  HAL_GPIO_EXTI_IRQHandler(GPIO_PIN_12);
 }
 
 extern UART_HandleTypeDef huart1;

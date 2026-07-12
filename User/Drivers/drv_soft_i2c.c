@@ -31,6 +31,8 @@
 
 #include "main.h"
 #include "cmsis_os2.h"
+#include "FreeRTOS.h"
+#include "semphr.h"
 
 
 /*==========================================================================
@@ -41,6 +43,12 @@
  * 为什么用静态变量而不是放在I2C_BusTypeDef结构体里
  *   当前只有一条I2C总线(i2c1),用静态变量更简洁*   如果将来需要多条总线,可以把osMutexId_t加入结构体*========================================================================*/
 static osMutexId_t i2c1_mutex = NULL;
+static StaticSemaphore_t i2c1_mutex_buffer;
+static const osMutexAttr_t i2c1_mutex_attributes = {
+	.name = "i2c1Mutex",
+	.cb_mem = &i2c1_mutex_buffer,
+	.cb_size = sizeof(i2c1_mutex_buffer),
+};
 
 
 /*
@@ -823,8 +831,10 @@ static void I2C_BusRecover(struct I2C_BusTypeDef *bus)
  *   3. 创建FreeRTOS互斥保护多任务并发访
  *   4. 初始化GPIO硬件(SDA/SCL为开漏输释放为高电平)
  *
- * 调用时机: FreeRTOS调度器启动后,任何I2C操作前调用一* 返回: 0=成功, -1=互斥锁创建失可能是FreeRTOS堆内存不
+ * 调用时机：FreeRTOS 调度器启动后、任何 I2C 操作前调用。
+ * 返回：0 表示成功，-1 表示静态互斥锁创建失败。
  *========================================================================*/
+/* 初始化并恢复软件 I2C 总线，重复调用时复用已创建的互斥锁。 */
 int I2C_BusInitialize(void)
 {
 	/* 步骤1: 初始化DWT CYCCNT微秒延时(详见DWT_Init注释) */
@@ -834,10 +844,15 @@ int I2C_BusInitialize(void)
 	 *   防止上次复位/掉电在I2C事务中途打断，导致从机持续拉低SDA锁死总线*   必须在DWT_Init()之后调用(依赖delay_us)，在osMutexNew之前调用(无需*/
 	I2C_BusRecover(&i2c1);
 
-	/* 步骤3: 创建互斥NULL参数表示使用默认属*/
-	i2c1_mutex = osMutexNew(NULL);
+	/* 步骤3: 首次调用时创建互斥锁，初始化重试时直接复用。 */
 	if (i2c1_mutex == NULL)
-		return -1;  /* 创建失败,可能是FreeRTOS堆内存不*/
+	{
+		i2c1_mutex = osMutexNew(&i2c1_mutex_attributes);
+		if (i2c1_mutex == NULL)
+		{
+			return -1;
+		}
+	}
 
 	/* 步骤4: 配置GPIO并释放总线为高电平(空闲*/
 	I2C_BusHardwareInitialize(&i2c1);
