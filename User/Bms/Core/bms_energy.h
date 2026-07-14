@@ -51,7 +51,8 @@ uint16_t BMS_EnergyGetSocPermille(void);
 
 /* 设置全局控制使能指令 */
 void BMS_EnergySetChargeEnable(uint8_t enable);
-void BMS_EnergySetDischargeEnable(uint8_t enable);
+/* Set discharge intent; enabling fails while the explicit recovery gate is closed. */
+uint8_t BMS_EnergySetDischargeEnable(uint8_t enable);
 void BMS_EnergySetBalanceEnable(uint8_t enable);
 
 #endif /* BMS_ENERGY_H */

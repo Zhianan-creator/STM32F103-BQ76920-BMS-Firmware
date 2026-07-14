@@ -16,6 +16,8 @@ typedef enum
     BMS_PROTECT_FAULT_OTD,
     BMS_PROTECT_FAULT_LTC,
     BMS_PROTECT_FAULT_LTD,
+    BMS_PROTECT_FAULT_DEVICE,
+    BMS_PROTECT_FAULT_OVRD,
     BMS_PROTECT_FAULT_MONITOR
 } BMS_ProtectFault_t;
 
@@ -32,6 +34,10 @@ typedef struct
     uint8_t ltc_active;
     uint8_t ltd_active;
     uint8_t fail_safe_active;
+    uint8_t device_fault_active;
+    uint8_t ovrd_active;
+    uint8_t discharge_rearm_required;
+    uint8_t device_restart_required;
     uint8_t safe_off_confirmed;
     uint8_t shutdown_active;
     uint8_t output_safe_confirmed;
@@ -63,6 +69,8 @@ typedef struct
     uint32_t otd_trigger_count;
     uint32_t ltc_trigger_count;
     uint32_t ltd_trigger_count;
+    uint32_t device_trigger_count;
+    uint32_t ovrd_trigger_count;
     uint32_t fail_safe_trigger_count;
 } BMS_ProtectState_t;
 
@@ -74,6 +82,12 @@ void BMS_ProtectUpdateFromMonitor(void);
 
 /* 锁存已进入 Ship 模式的终止状态，禁止后续重新开启 MOS。 */
 void BMS_ProtectLatchShutdown(void);
+
+/* Persist a BQ hardware fault before its W1C status bit is cleared. */
+void BMS_ProtectLatchHardwareFault(BMS_ProtectFault_t fault);
+
+/* Explicitly rearm OCD/SCD only after cooldown and confirmed load removal. */
+uint8_t BMS_ProtectTryRearmDischarge(void);
 
 /* 获取当前保护状态的只读指针。 */
 const BMS_ProtectState_t *BMS_ProtectGetState(void);

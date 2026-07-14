@@ -4,7 +4,6 @@
 #include "bms_protect.h"
 #include "bms_energy.h"
 #include "bms_analysis.h"
-#include "bms_log.h"
 #include "bms_init.h"
 #include "cmsis_os2.h"
 #include <stdio.h>
@@ -71,11 +70,6 @@ void BMS_SampleTask(void *argument)
             osDelay(SAMPLE_PERIOD_MS);
         }
     }
-
-    BMS_LogInit();
-    BMS_MonitorInit();
-    BMS_ProtectInit();
-    BMS_EnergyInit();
 
     for (;;)
     {

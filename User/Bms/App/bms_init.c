@@ -2,6 +2,10 @@
 #include "bms_config.h"
 #include "drv_soft_i2c.h"
 #include "drv_softi2c_bq769x0.h"
+#include "bms_log.h"
+#include "bms_monitor.h"
+#include "bms_protect.h"
+#include "bms_energy.h"
 #include "cmsis_os2.h"
 #include "FreeRTOS.h"
 #include "event_groups.h"
@@ -15,6 +19,21 @@ static BMS_InitResult_t init_result;
 static StaticEventGroup_t init_event_buffer;
 static EventGroupHandle_t init_event;
 
+/* ALERT callbacks run in the alert task, never in the GPIO ISR. */
+static void BMS_InitLatchHardwareFault(BMS_ProtectFault_t fault)
+{
+    BMS_EnergySetChargeEnable(0U);
+    (void)BMS_EnergySetDischargeEnable(0U);
+    BMS_ProtectLatchHardwareFault(fault);
+}
+
+static void BMS_InitHandleOcd(void)    { BMS_InitLatchHardwareFault(BMS_PROTECT_FAULT_OCD); }
+static void BMS_InitHandleScd(void)    { BMS_InitLatchHardwareFault(BMS_PROTECT_FAULT_SCD); }
+static void BMS_InitHandleOv(void)     { BMS_InitLatchHardwareFault(BMS_PROTECT_FAULT_OV); }
+static void BMS_InitHandleUv(void)     { BMS_InitLatchHardwareFault(BMS_PROTECT_FAULT_UV); }
+static void BMS_InitHandleOvrd(void)   { BMS_InitLatchHardwareFault(BMS_PROTECT_FAULT_OVRD); }
+static void BMS_InitHandleDevice(void) { BMS_InitLatchHardwareFault(BMS_PROTECT_FAULT_DEVICE); }
+
 /* 填充 BQ769X0 的硬件保护初始化参数。 */
 static void BMS_InitFillBqConfig(BQ769X0_InitDataTypedef *config)
 {
@@ -24,7 +43,13 @@ static void BMS_InitFillBqConfig(BQ769X0_InitDataTypedef *config)
     config->ConfigData.OVDelay = (BQ769X0_OVDelayTypedef)INIT_OV_DELAY;
     config->ConfigData.UVDelay = (BQ769X0_UVDelayTypedef)INIT_UV_DELAY;
     config->ConfigData.OVPThreshold = (uint16_t)(INIT_OV_PROTECT * 1000.0f);
-    config->ConfigData.UVPThreshold = (uint16_t)(INIT_UV_PROTECT * 1000.0f);
+    config->ConfigData.UVPThreshold = (uint16_t)(INIT_HW_UV_PROTECT * 1000.0f);
+    config->AlertOps.ocd = BMS_InitHandleOcd;
+    config->AlertOps.scd = BMS_InitHandleScd;
+    config->AlertOps.ov = BMS_InitHandleOv;
+    config->AlertOps.uv = BMS_InitHandleUv;
+    config->AlertOps.ovrd = BMS_InitHandleOvrd;
+    config->AlertOps.device = BMS_InitHandleDevice;
 }
 
 /* 执行一次 I2C、地址、CRC 和 BQ 配置验证。 */
@@ -116,6 +141,11 @@ int BMS_InitRun(void)
                 BQ769X0_ForceSafeOff(BMS_SAFE_OFF_RETRY_COUNT) ? 1U : 0U;
             if (init_result.safe_off_ok)
             {
+                /* Initialize consumers before waking the higher-priority ALERT task. */
+                BMS_LogInit();
+                BMS_MonitorInit();
+                BMS_ProtectInit();
+                BMS_EnergyInit();
                 init_result.done = 1U;
                 xEventGroupSetBits(init_event, BMS_INIT_EVENT_DONE | BMS_INIT_EVENT_OK);
                 printf("[BQ] Init OK (attempt %u)\r\n", (unsigned int)attempt);
@@ -160,5 +190,5 @@ const BMS_InitResult_t *BMS_InitGetResult(void)
 /* 查询 BQ769X0 是否已成功初始化。 */
 uint8_t BMS_InitIsOk(void)
 {
-    return init_result.init_ok && init_result.safe_off_ok;
+    return init_result.done && init_result.init_ok && init_result.safe_off_ok;
 }

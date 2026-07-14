@@ -316,7 +316,7 @@ static void BMS_CAN_HandleDsgOff(void)
         return;
     }
 
-    BMS_EnergySetDischargeEnable(0);
+    (void)BMS_EnergySetDischargeEnable(0U);
 
     (void)BMS_ControlDsgOff();
 }

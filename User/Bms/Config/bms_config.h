@@ -87,6 +87,13 @@
 #define INIT_UV_PROTECT			TLB_UV_PROTECT			// 单体欠压保护电压(V)(注意BQ769X0 UV范围.58~3.10V)
 #define INIT_UV_RELIEVE			TLB_UV_RELIEVE			// 单体欠压恢复电压(V)
 
+/*
+ * BQ769X0 hardware UV is an independent backstop.  Keep it below the
+ * 3.10 V software threshold and still validate it against each device's
+ * measured ADC gain/offset during initialization.
+ */
+#define INIT_HW_UV_PROTECT       2.80
+
 #define INIT_SHUTDOWN_VOLTAGE	TLB_SHUTDOWN_VOLTAGE	// 自动关机电压(V),暂未使用,预留
 #define INIT_BALANCE_VOLTAGE	TLB_BALANCE_VOLTAGE		// 均衡起始电压(V)
 

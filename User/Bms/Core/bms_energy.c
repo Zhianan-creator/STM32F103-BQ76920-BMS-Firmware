@@ -359,9 +359,22 @@ void BMS_EnergySetChargeEnable(uint8_t enable)
     energy_state.charge_enable_cmd = enable;
 }
 
-void BMS_EnergySetDischargeEnable(uint8_t enable)
+uint8_t BMS_EnergySetDischargeEnable(uint8_t enable)
 {
-    energy_state.discharge_enable_cmd = enable;
+    if (enable == 0U)
+    {
+        energy_state.discharge_enable_cmd = 0U;
+        return 1U;
+    }
+
+    if (!BMS_ProtectTryRearmDischarge())
+    {
+        energy_state.discharge_enable_cmd = 0U;
+        return 0U;
+    }
+
+    energy_state.discharge_enable_cmd = 1U;
+    return 1U;
 }
 
 void BMS_EnergySetBalanceEnable(uint8_t enable)

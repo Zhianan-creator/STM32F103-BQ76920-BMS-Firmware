@@ -28,6 +28,18 @@ void BMS_AlertTask(void *argument)
     {
         const BMS_ProtectState_t *protect = BMS_ProtectGetState();
 
+        if ((protect != NULL) && protect->device_restart_required)
+        {
+            /* Restart enters the initialization-only DEVICE recovery path. */
+            if (protect->output_safe_confirmed ||
+                BQ769X0_ForceSafeOff(BMS_SAFE_OFF_RETRY_COUNT))
+            {
+                vTaskDelay(pdMS_TO_TICKS(10U));
+                NVIC_SystemReset();
+            }
+            vTaskDelay(pdMS_TO_TICKS(BMS_ALERT_POLL_MS));
+            continue;
+        }
         if ((protect != NULL) && protect->shutdown_active)
         {
             vTaskDelay(pdMS_TO_TICKS(BMS_ALERT_POLL_MS));

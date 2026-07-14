@@ -5,6 +5,8 @@
 #include "bms_control.h"
 #include "drv_softi2c_bq769x0.h"
 #include "cmsis_os2.h"
+#include "FreeRTOS.h"
+#include "task.h"
 #include <string.h>
 
 #define PROTECT_OV_RELEASE_DELTA_MV     50
@@ -13,6 +15,14 @@
 #define PROTECT_OCD_RECOVERY_MS       3000U
 #define PROTECT_SCD_RECOVERY_MS       3000U
 #define PROTECT_SHUTDOWN_DELAY_MS     5000U
+#define PROTECT_HW_REARM_COOLDOWN_MS  3000U
+#define PROTECT_LOAD_REMOVAL_SAMPLES     3U
+#define PROTECT_LOAD_SAMPLE_INTERVAL_MS 100U
+
+#define PROTECT_HW_FAULT_OCD          (1U << 0)
+#define PROTECT_HW_FAULT_SCD          (1U << 1)
+#define PROTECT_HW_FAULT_DEVICE       (1U << 2)
+#define PROTECT_HW_FAULT_OVRD         (1U << 3)
 
 typedef struct
 {
@@ -54,6 +64,8 @@ static int SOFT_PROT_SCD_DELAY_MS = 1;
 static uint8_t invalid_sample_count;
 static uint8_t recovery_sample_count;
 static uint32_t shutdown_pending_tick;
+static volatile uint8_t hardware_fault_latch;
+static uint32_t hardware_discharge_fault_tick;
 
 /* 更新一个带触发延时、恢复阈值和恢复延时的保护条件。 */
 static BMS_ProtectTransition_t BMS_ProtectUpdateGuard(BMS_ProtectGuard_t *guard,
@@ -136,13 +148,22 @@ static void BMS_ProtectSyncState(void)
 {
     protect_state.ov_active = ov_guard.active;
     protect_state.uv_active = uv_guard.active;
-    protect_state.ocd_active = ocd_guard.active;
-    protect_state.scd_active = scd_guard.active;
+    protect_state.ocd_active = ocd_guard.active ||
+                               ((hardware_fault_latch & PROTECT_HW_FAULT_OCD) != 0U);
+    protect_state.scd_active = scd_guard.active ||
+                               ((hardware_fault_latch & PROTECT_HW_FAULT_SCD) != 0U);
     protect_state.occ_active = occ_guard.active;
     protect_state.otc_active = otc_guard.active;
     protect_state.otd_active = otd_guard.active;
     protect_state.ltc_active = ltc_guard.active;
     protect_state.ltd_active = ltd_guard.active;
+    protect_state.device_fault_active =
+        ((hardware_fault_latch & PROTECT_HW_FAULT_DEVICE) != 0U);
+    protect_state.ovrd_active =
+        ((hardware_fault_latch & PROTECT_HW_FAULT_OVRD) != 0U);
+    protect_state.discharge_rearm_required =
+        ((hardware_fault_latch & (PROTECT_HW_FAULT_OCD | PROTECT_HW_FAULT_SCD)) != 0U);
+    protect_state.device_restart_required = protect_state.device_fault_active;
 
     protect_state.ov_pending = ov_guard.pending;
     protect_state.uv_pending = uv_guard.pending;
@@ -155,9 +176,13 @@ static void BMS_ProtectSyncState(void)
     protect_state.ltd_pending = ltd_guard.pending;
 
     protect_state.charge_allowed = !(protect_state.ov_active ||
+                                     protect_state.ocd_active ||
+                                     protect_state.scd_active ||
                                      protect_state.occ_active ||
                                      protect_state.otc_active ||
                                      protect_state.ltc_active ||
+                                     protect_state.device_fault_active ||
+                                     protect_state.ovrd_active ||
                                      protect_state.fail_safe_active ||
                                      protect_state.shutdown_active);
     protect_state.discharge_allowed = !(protect_state.uv_active ||
@@ -165,6 +190,8 @@ static void BMS_ProtectSyncState(void)
                                         protect_state.scd_active ||
                                         protect_state.otd_active ||
                                         protect_state.ltd_active ||
+                                        protect_state.device_fault_active ||
+                                        protect_state.ovrd_active ||
                                         protect_state.fail_safe_active ||
                                         protect_state.shutdown_active);
     protect_state.any_active = !(protect_state.charge_allowed &&
@@ -194,6 +221,8 @@ void BMS_ProtectInit(void)
     invalid_sample_count = 0U;
     recovery_sample_count = 0U;
     shutdown_pending_tick = 0U;
+    hardware_fault_latch = 0U;
+    hardware_discharge_fault_tick = 0U;
     protect_state.charge_allowed = 1U;
     protect_state.discharge_allowed = 1U;
     protect_state.output_safe_confirmed = 1U;
@@ -463,6 +492,199 @@ void BMS_ProtectLatchShutdown(void)
     BMS_LOGW("PROTECT", "shutdown latched");
 }
 
+/* Persist a hardware fault before the driver clears its W1C status bit. */
+void BMS_ProtectLatchHardwareFault(BMS_ProtectFault_t fault)
+{
+    const BMS_MonitorData_t *mon = BMS_MonitorGetData();
+    int32_t value = -1;
+    uint8_t cell = 0U;
+    uint8_t newly_latched = 0U;
+    uint32_t now = osKernelGetTickCount();
+
+    if ((mon != NULL) && mon->data_valid)
+    {
+        if (fault == BMS_PROTECT_FAULT_OV)
+        {
+            value = mon->max_cell_mv;
+        }
+        else if (fault == BMS_PROTECT_FAULT_UV)
+        {
+            value = mon->min_cell_mv;
+        }
+        else if ((fault == BMS_PROTECT_FAULT_OCD) ||
+                 (fault == BMS_PROTECT_FAULT_SCD))
+        {
+            value = (mon->current_ma < 0) ? -mon->current_ma : mon->current_ma;
+        }
+    }
+
+    taskENTER_CRITICAL();
+    switch (fault)
+    {
+        case BMS_PROTECT_FAULT_OV:
+            if (!ov_guard.active)
+            {
+                ov_guard.active = 1U;
+                ov_guard.pending = 0U;
+                protect_state.ov_trigger_count++;
+                newly_latched = 1U;
+            }
+            break;
+
+        case BMS_PROTECT_FAULT_UV:
+            if (!uv_guard.active)
+            {
+                uv_guard.active = 1U;
+                uv_guard.pending = 0U;
+                protect_state.uv_trigger_count++;
+                newly_latched = 1U;
+            }
+            break;
+
+        case BMS_PROTECT_FAULT_OCD:
+            /* Every repeated trip restarts the cooldown from the latest event. */
+            hardware_discharge_fault_tick = now;
+            if ((hardware_fault_latch & PROTECT_HW_FAULT_OCD) == 0U)
+            {
+                hardware_fault_latch |= PROTECT_HW_FAULT_OCD;
+                protect_state.ocd_trigger_count++;
+                newly_latched = 1U;
+            }
+            break;
+
+        case BMS_PROTECT_FAULT_SCD:
+            /* Every repeated trip restarts the cooldown from the latest event. */
+            hardware_discharge_fault_tick = now;
+            if ((hardware_fault_latch & PROTECT_HW_FAULT_SCD) == 0U)
+            {
+                hardware_fault_latch |= PROTECT_HW_FAULT_SCD;
+                protect_state.scd_trigger_count++;
+                newly_latched = 1U;
+            }
+            break;
+
+        case BMS_PROTECT_FAULT_DEVICE:
+            if ((hardware_fault_latch & PROTECT_HW_FAULT_DEVICE) == 0U)
+            {
+                hardware_fault_latch |= PROTECT_HW_FAULT_DEVICE;
+                protect_state.device_trigger_count++;
+                newly_latched = 1U;
+            }
+            break;
+
+        case BMS_PROTECT_FAULT_OVRD:
+            if ((hardware_fault_latch & PROTECT_HW_FAULT_OVRD) == 0U)
+            {
+                hardware_fault_latch |= PROTECT_HW_FAULT_OVRD;
+                protect_state.ovrd_trigger_count++;
+                newly_latched = 1U;
+            }
+            break;
+
+        default:
+            break;
+    }
+
+    if (newly_latched)
+    {
+        protect_state.last_fault = fault;
+        protect_state.last_fault_cell = cell;
+        protect_state.last_fault_value = value;
+    }
+    BMS_ProtectSyncState();
+    taskEXIT_CRITICAL();
+
+    /* Execute the safety action before any potentially blocking UART log. */
+    protect_state.output_safe_confirmed =
+        BMS_ControlApplyProtectState(&protect_state);
+    if (newly_latched)
+    {
+        BMS_LOGE("PROTECT", "HW %s latched before SYS_STAT clear",
+                 BMS_ProtectFaultToString(fault));
+    }
+}
+
+/* Explicit OCD/SCD rearm: cooldown, safe-off, load removal, then clear latch. */
+uint8_t BMS_ProtectTryRearmDischarge(void)
+{
+    uint8_t latch_snapshot;
+    uint8_t allowed;
+    uint8_t result = 0U;
+    uint8_t sys_stat = 0U;
+    uint8_t sample_index;
+    bool load_present = false;
+    uint32_t now = osKernelGetTickCount();
+    uint32_t fault_tick_snapshot;
+
+    taskENTER_CRITICAL();
+    latch_snapshot = hardware_fault_latch;
+    fault_tick_snapshot = hardware_discharge_fault_tick;
+    taskEXIT_CRITICAL();
+
+    if ((latch_snapshot & (PROTECT_HW_FAULT_DEVICE | PROTECT_HW_FAULT_OVRD)) != 0U)
+    {
+        return 0U;
+    }
+    if ((latch_snapshot & (PROTECT_HW_FAULT_OCD | PROTECT_HW_FAULT_SCD)) == 0U)
+    {
+        return BMS_ProtectIsDischargeAllowed();
+    }
+    if ((uint32_t)(now - fault_tick_snapshot) <
+        PROTECT_HW_REARM_COOLDOWN_MS)
+    {
+        return 0U;
+    }
+
+    for (sample_index = 0U;
+         sample_index < PROTECT_LOAD_REMOVAL_SAMPLES;
+         sample_index++)
+    {
+        load_present = false;
+        sys_stat = 0U;
+        BQ769X0_BusLock();
+        if (!BQ769X0_ForceSafeOff(BMS_SAFE_OFF_RETRY_COUNT) ||
+            !BQ769X0_LoadPresentGet(&load_present) || load_present ||
+            !BQ769X0_ReadRegisterByteWithCRC(SYS_STAT, &sys_stat) ||
+            ((sys_stat & (SYS_STAT_OCD_BIT | SYS_STAT_SCD_BIT |
+                          SYS_STAT_OV_BIT | SYS_STAT_UV_BIT |
+                          SYS_STAT_OVRD_BIT | SYS_STAT_DEVICE_BIT)) != 0U))
+        {
+            goto out;
+        }
+
+        if ((sample_index + 1U) < PROTECT_LOAD_REMOVAL_SAMPLES)
+        {
+            BQ769X0_BusUnlock();
+            osDelay(PROTECT_LOAD_SAMPLE_INTERVAL_MS);
+        }
+    }
+
+    taskENTER_CRITICAL();
+    if ((hardware_fault_latch == latch_snapshot) &&
+        (hardware_discharge_fault_tick == fault_tick_snapshot))
+    {
+        hardware_fault_latch &=
+            (uint8_t)~(PROTECT_HW_FAULT_OCD | PROTECT_HW_FAULT_SCD);
+        BMS_ProtectSyncState();
+        allowed = protect_state.discharge_allowed;
+    }
+    else
+    {
+        allowed = 0U;
+    }
+    taskEXIT_CRITICAL();
+
+    result = allowed;
+
+out:
+    BQ769X0_BusUnlock();
+    if (result)
+    {
+        BMS_LOGI("PROTECT", "HW discharge fault rearmed after stable load removal");
+    }
+    return result;
+}
+
 /* 获取当前保护状态的只读指针。 */
 const BMS_ProtectState_t *BMS_ProtectGetState(void)
 {
@@ -508,6 +730,8 @@ const char *BMS_ProtectFaultToString(BMS_ProtectFault_t fault)
         case BMS_PROTECT_FAULT_OTD:     return "OTD";
         case BMS_PROTECT_FAULT_LTC:     return "LTC";
         case BMS_PROTECT_FAULT_LTD:     return "LTD";
+        case BMS_PROTECT_FAULT_DEVICE:  return "DEVICE_XREADY";
+        case BMS_PROTECT_FAULT_OVRD:    return "OVRD_ALERT";
         case BMS_PROTECT_FAULT_MONITOR: return "MONITOR";
         default:                        return "UNKNOWN";
     }

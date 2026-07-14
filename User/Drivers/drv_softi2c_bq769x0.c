@@ -44,6 +44,7 @@
  */
 
 #include "drv_softi2c_bq769x0.h"
+#include "bq769x0_threshold.h"
 
 #include <math.h>     /* 用于log()函数,热敏电阻温度计算 */
 
@@ -61,6 +62,9 @@
 #else
 #define BQ769X0_RUNTIME_PRINTF(...)   do {} while (0)
 #endif
+
+#define BQ769X0_DEVICE_RECOVERY_WAIT_MS  3000U
+#define BQ769X0_DEVICE_SAFE_OFF_RETRIES      3U
 
 
 /*==========================================================================
@@ -838,89 +842,126 @@ void BQ769X0_AlertNotifyFromISR(void)
     (SYS_STAT_OVRD_BIT | SYS_STAT_UV_BIT | SYS_STAT_OV_BIT | \
      SYS_STAT_SCD_BIT | SYS_STAT_OCD_BIT | SYS_STAT_DEVICE_BIT)
 
-static void BQ769X0_HandleSysStat(uint8_t sys_stat)
+static bool BQ769X0_HandleSysStat(uint8_t sys_stat)
 {
+	uint8_t clear_mask;
+	uint8_t readback = 0U;
+
 	if (sys_stat == 0)
 	{
-		return;
+		return true;
 	}
 
 	if ((sys_stat & BQ_SYS_STAT_FAULT_MASK) == 0)
 	{
-		BQ769X0_WriteRegisterByteWithCRC(SYS_STAT, sys_stat);
+		if (!BQ769X0_WriteRegisterByteWithCRC(SYS_STAT, sys_stat))
+		{
+			return false;
+		}
 		if ((sys_stat & SYS_STAT_CC_BIT) && AlertOps.cc != NULL)
 		{
 			AlertOps.cc();
 		}
-		return;
+		return true;
 	}
 
-	BQ769X0_RUNTIME_PRINTF("[ALERT] SYS_STAT=0x%02X\r\n", sys_stat);
-
-	if (sys_stat & SYS_STAT_CC_BIT)
-	{
-		if (AlertOps.cc != NULL) AlertOps.cc();
-	}
-
+	/* Dispatch safety callbacks before any potentially blocking UART output. */
 	if (sys_stat & SYS_STAT_DEVICE_BIT)
 	{
-		BQ769X0_RUNTIME_PRINTF("[ALERT][DEVICE] Device fault\r\n");
 		if (AlertOps.device != NULL) AlertOps.device();
 	}
-
 	if (sys_stat & SYS_STAT_OVRD_BIT)
 	{
-		BQ769X0_RUNTIME_PRINTF("[ALERT][OVRD] External alert override\r\n");
 		if (AlertOps.ovrd != NULL) AlertOps.ovrd();
 	}
-
 	if (sys_stat & SYS_STAT_UV_BIT)
 	{
-		BQ769X0_RUNTIME_PRINTF("[ALERT][UV] Under voltage fault\r\n");
 		if (AlertOps.uv != NULL) AlertOps.uv();
 	}
-
 	if (sys_stat & SYS_STAT_OV_BIT)
 	{
-		BQ769X0_RUNTIME_PRINTF("[ALERT][OV] Over voltage fault\r\n");
 		if (AlertOps.ov != NULL) AlertOps.ov();
 	}
-
 	if (sys_stat & SYS_STAT_SCD_BIT)
 	{
-		BQ769X0_RUNTIME_PRINTF("[ALERT][SCD] Short circuit discharge fault\r\n");
 		if (AlertOps.scd != NULL) AlertOps.scd();
 	}
-
 	if (sys_stat & SYS_STAT_OCD_BIT)
 	{
-		BQ769X0_RUNTIME_PRINTF("[ALERT][OCD] Over current discharge fault\r\n");
 		if (AlertOps.ocd != NULL) AlertOps.ocd();
 	}
 
-	BQ769X0_WriteRegisterByteWithCRC(SYS_STAT, sys_stat);
-	BQ769X0_RUNTIME_PRINTF("[ALERT] SYS_STAT cleared: 0x%02X\r\n", sys_stat);
+	BQ769X0_RUNTIME_PRINTF("[ALERT] SYS_STAT=0x%02X\r\n", sys_stat);
+	if (sys_stat & SYS_STAT_DEVICE_BIT)
+		BQ769X0_RUNTIME_PRINTF("[ALERT][DEVICE] Device fault\r\n");
+	if (sys_stat & SYS_STAT_OVRD_BIT)
+		BQ769X0_RUNTIME_PRINTF("[ALERT][OVRD] External alert override\r\n");
+	if (sys_stat & SYS_STAT_UV_BIT)
+		BQ769X0_RUNTIME_PRINTF("[ALERT][UV] Under voltage fault\r\n");
+	if (sys_stat & SYS_STAT_OV_BIT)
+		BQ769X0_RUNTIME_PRINTF("[ALERT][OV] Over voltage fault\r\n");
+	if (sys_stat & SYS_STAT_SCD_BIT)
+		BQ769X0_RUNTIME_PRINTF("[ALERT][SCD] Short circuit discharge fault\r\n");
+	if (sys_stat & SYS_STAT_OCD_BIT)
+		BQ769X0_RUNTIME_PRINTF("[ALERT][OCD] Over current discharge fault\r\n");
+	if ((sys_stat & SYS_STAT_CC_BIT) && (AlertOps.cc != NULL))
+	{
+		AlertOps.cc();
+	}
+
+	/* DEVICE_XREADY remains latched until a controlled full restart/re-init. */
+	clear_mask = (uint8_t)(sys_stat &
+		(SYS_STAT_CC_BIT | SYS_STAT_OVRD_BIT | SYS_STAT_UV_BIT |
+		 SYS_STAT_OV_BIT | SYS_STAT_SCD_BIT | SYS_STAT_OCD_BIT));
+	if (clear_mask != 0U)
+	{
+		if (!BQ769X0_WriteRegisterByteWithCRC(SYS_STAT, clear_mask) ||
+			!BQ769X0_ReadRegisterByteWithCRC(SYS_STAT, &readback))
+		{
+			return false;
+		}
+		if ((readback & clear_mask & BQ_SYS_STAT_FAULT_MASK) != 0U)
+		{
+			BQ769X0_RUNTIME_PRINTF(
+				"[ALERT] SYS_STAT fault still active after W1C: 0x%02X\r\n",
+				(unsigned int)readback);
+			return false;
+		}
+		BQ769X0_RUNTIME_PRINTF("[ALERT] SYS_STAT cleared: 0x%02X\r\n",
+								 (unsigned int)clear_mask);
+	}
+	if ((sys_stat & SYS_STAT_DEVICE_BIT) != 0U)
+	{
+		BQ769X0_RUNTIME_PRINTF(
+			"[ALERT][DEVICE] latched; controlled restart and full register verification required\r\n");
+	}
+	return true;
 }
 
 bool BQ769X0_ProcessAlert(void)
 {
 	uint8_t reg_value = 0;
+	bool result;
+
+	BQ769X0_BusLock();
 
 	/* 每次都读取 SYS_STAT；任务的超时轮询负责兜底丢失的边沿通知。 */
 	if (BQ769X0_ReadRegisterByteWithCRC(SYS_STAT, &reg_value) != true)
 	{
+		BQ769X0_BusUnlock();
 		return false;
 	}
 
 	if (reg_value == 0)
 	{
+		BQ769X0_BusUnlock();
 		return true;
 	}
 
-	/* Handle the real hardware alert and clear SYS_STAT. */
-	BQ769X0_HandleSysStat(reg_value);
-
-	return true;
+	/* Callbacks latch policy state before any W1C register write. */
+	result = BQ769X0_HandleSysStat(reg_value);
+	BQ769X0_BusUnlock();
+	return result;
 }
 
 /*==========================================================================
@@ -960,6 +1001,117 @@ static bool BQ769X0_GetADCGainOffset(void)
 	}
 
 	return true;
+}
+
+/* Build protection registers only after both physical thresholds are valid. */
+static bool BQ769X0_PrepareProtectionRegisters(
+	const BQ769X0_ConfigDataTypedef *config,
+	uint16_t *actual_uv_mv,
+	uint16_t *actual_ov_mv)
+{
+	uint8_t uv_trip;
+	uint8_t ov_trip;
+
+	if ((config == NULL) || (actual_uv_mv == NULL) || (actual_ov_mv == NULL))
+	{
+		return false;
+	}
+
+	if (!BQ769X0_ThresholdEncode(config->UVPThreshold, (uint16_t)iGain,
+									Adcoffset, BQ769X0_TRIP_UV,
+									&uv_trip, actual_uv_mv) ||
+		!BQ769X0_ThresholdEncode(config->OVPThreshold, (uint16_t)iGain,
+									Adcoffset, BQ769X0_TRIP_OV,
+									&ov_trip, actual_ov_mv))
+	{
+		BQ769X0_RUNTIME_PRINTF(
+			"[BQ] Threshold out of calibrated range: UV=%umV OV=%umV gain=%uuV offset=%dmV\r\n",
+			(unsigned int)config->UVPThreshold,
+			(unsigned int)config->OVPThreshold,
+			(unsigned int)iGain,
+			(int)Adcoffset);
+		return false;
+	}
+
+	Registers.Protect1.Protect1Bit.SCD_THRESH = SCDThresh;
+	Registers.Protect2.Protect2Bit.OCD_THRESH = OCDThresh;
+	Registers.Protect1.Protect1Bit.SCD_DELAY = config->SCDDelay;
+	Registers.Protect2.Protect2Bit.OCD_DELAY = config->OCDDelay;
+	Registers.Protect3.Protect3Bit.UV_DELAY = config->UVDelay;
+	Registers.Protect3.Protect3Bit.OV_DELAY = config->OVDelay;
+	Registers.UVTrip = uv_trip;
+	Registers.OVTrip = ov_trip;
+	return true;
+}
+
+/* Verify a fresh register read and reconstruct its calibrated physical value. */
+static bool BQ769X0_VerifyTripRegister(uint8_t reg,
+									   uint8_t expected,
+									   uint16_t expected_actual_mv,
+									   BQ769X0_TripThresholdType_t type,
+									   uint16_t *actual_mv)
+{
+	uint8_t readback = 0U;
+	uint16_t decoded_mv = 0U;
+
+	if (!BQ769X0_ReadRegisterByteWithCRC(reg, &readback) ||
+		(readback != expected) ||
+		!BQ769X0_ThresholdDecode(readback, (uint16_t)iGain, Adcoffset,
+								 type, &decoded_mv) ||
+		(decoded_mv != expected_actual_mv))
+	{
+		BQ769X0_RUNTIME_PRINTF(
+			"[BQ] Threshold verify failed: reg=0x%02X expect=0x%02X got=0x%02X\r\n",
+			(unsigned int)reg, (unsigned int)expected, (unsigned int)readback);
+		return false;
+	}
+
+	if (actual_mv != NULL)
+	{
+		*actual_mv = decoded_mv;
+	}
+	return true;
+}
+
+/* Program one threshold atomically and commit the software mirror after readback. */
+static bool BQ769X0_ProgramTripThreshold(uint8_t reg,
+									 uint16_t requested_mv,
+									 BQ769X0_TripThresholdType_t type,
+									 uint8_t *mirror,
+									 uint16_t *actual_mv)
+{
+	uint8_t encoded = 0U;
+	uint16_t expected_actual_mv = 0U;
+	bool result = false;
+
+	if ((mirror == NULL) ||
+		!BQ769X0_ThresholdEncode(requested_mv, (uint16_t)iGain, Adcoffset,
+								 type, &encoded, &expected_actual_mv))
+	{
+		BQ769X0_RUNTIME_PRINTF(
+			"[BQ] Reject threshold: requested=%umV gain=%uuV offset=%dmV\r\n",
+			(unsigned int)requested_mv, (unsigned int)iGain, (int)Adcoffset);
+		return false;
+	}
+
+	BQ769X0_BusLock();
+	if (BQ769X0_WriteRegisterByteWithCRC(reg, encoded) &&
+		BQ769X0_VerifyTripRegister(reg, encoded, expected_actual_mv,
+									 type, actual_mv))
+	{
+		*mirror = encoded;
+		result = true;
+	}
+	BQ769X0_BusUnlock();
+
+	if (result)
+	{
+		BQ769X0_RUNTIME_PRINTF(
+			"[BQ] Threshold programmed: requested=%umV reg=0x%02X actual=%umV\r\n",
+			(unsigned int)requested_mv, (unsigned int)encoded,
+			(unsigned int)expected_actual_mv);
+	}
+	return result;
 }
 
 
@@ -1015,6 +1167,49 @@ static bool BQ769X0_Configuration(void)
 	return true;
 }
 
+/*
+ * DEVICE_XREADY is never cleared by the runtime alert path.  A controlled
+ * restart reaches this initialization-only recovery: keep outputs safe,
+ * wait for the device to settle, clear only DEVICE_XREADY, then reload and
+ * verify the complete calibrated protection configuration.
+ */
+static bool BQ769X0_ClearDeviceForInitialization(void)
+{
+	uint8_t sys_stat = 0U;
+	bool clear_ok;
+
+	if (!BQ769X0_ReadRegisterByteWithCRC(SYS_STAT, &sys_stat))
+	{
+		return false;
+	}
+	if ((sys_stat & SYS_STAT_DEVICE_BIT) == 0U)
+	{
+		return true;
+	}
+
+	BQ769X0_RUNTIME_PRINTF(
+		"[BQ] DEVICE_XREADY recovery: safe-off, wait 3000ms, reload config\r\n");
+	if (!BQ769X0_ForceSafeOff(BQ769X0_DEVICE_SAFE_OFF_RETRIES))
+	{
+		return false;
+	}
+	BQ769X0_DELAY(BQ769X0_DEVICE_RECOVERY_WAIT_MS);
+
+	BQ769X0_BusLock();
+	clear_ok = BQ769X0_WriteRegisterByteWithCRC(SYS_STAT,
+												 SYS_STAT_DEVICE_BIT) &&
+			   BQ769X0_ReadRegisterByteWithCRC(SYS_STAT, &sys_stat);
+	BQ769X0_BusUnlock();
+	if (!clear_ok || ((sys_stat & SYS_STAT_DEVICE_BIT) != 0U))
+	{
+		BQ769X0_RUNTIME_PRINTF(
+			"[BQ] DEVICE_XREADY clear/readback failed: SYS_STAT=0x%02X\r\n",
+			(unsigned int)sys_stat);
+		return false;
+	}
+	return true;
+}
+
 
 
 /*
@@ -1022,17 +1217,40 @@ static bool BQ769X0_Configuration(void)
  * BQ769X0可以检测电池包是否连接了负* 条件: 充电MOS关闭(CHG_ON=0) LOAD_PRESENT标志置位
  * LOAD_PRESENT标志在SYS_CTRL1寄存器中(只读)
  */
+bool BQ769X0_LoadPresentGet(bool *present)
+{
+	uint8_t ctrl1 = 0U;
+	uint8_t ctrl2 = 0U;
+	bool result = false;
+
+	if (present == NULL)
+	{
+		return false;
+	}
+
+	BQ769X0_BusLock();
+	if (!BQ769X0_ReadRegisterByteWithCRC(SYS_CTRL1, &ctrl1) ||
+		!BQ769X0_ReadRegisterByteWithCRC(SYS_CTRL2, &ctrl2) ||
+		((ctrl2 & (uint8_t)CHG_CONTROL) != 0U))
+	{
+		goto out;
+	}
+
+	Registers.SysCtrl1.SysCtrl1Byte = ctrl1;
+	Registers.SysCtrl2.SysCtrl2Byte = ctrl2;
+	*present = ((ctrl1 & 0x80U) != 0U);
+	result = true;
+
+out:
+	BQ769X0_BusUnlock();
+	return result;
+}
+
 bool BQ769X0_LoadDetect(void)
 {
-	BQ769X0_ReadRegisterWordWithCRC(SYS_CTRL1, (uint16_t *)&Registers.SysCtrl1.SysCtrl1Byte);
-	if (Registers.SysCtrl2.SysCtrl2Bit.CHG_ON == 0)  /* 不在充电状*/
-	{
-		if (Registers.SysCtrl1.SysCtrl1Bit.LOAD_PRESENT)
-		{
-			return true;  /* 检测到负载 */
-		}
-	}
-	return false;
+	bool present = false;
+
+	return BQ769X0_LoadPresentGet(&present) && present;
 }
 
 /*
@@ -1201,18 +1419,24 @@ void BQ769X0_OVDelaySet(BQ769X0_OVDelayTypedef OVDelay)
 	BQ769X0_WriteRegisterByteWithCRC(PROTECT3, Registers.Protect3.Protect3Byte);
 }
 
-/* 修改UV阈mV) */
-void BQ769X0_UVPThresholdSet(uint16_t UVPThreshold)
+/* Modify UV threshold and verify the calibrated physical value. */
+bool BQ769X0_UVPThresholdSet(uint16_t UVPThreshold)
 {
-	Registers.UVTrip = (uint8_t)((((uint16_t)((UVPThreshold - Adcoffset) / Gain) - UV_THRESH_BASE) >> 4) & 0xFF);
-	BQ769X0_WriteRegisterByteWithCRC(UV_TRIP, Registers.UVTrip);
+	uint16_t actual_mv = 0U;
+
+	return BQ769X0_ProgramTripThreshold(UV_TRIP, UVPThreshold,
+										 BQ769X0_TRIP_UV, &Registers.UVTrip,
+										 &actual_mv);
 }
 
-/* 修改OV阈mV) */
-void BQ769X0_OVPThresholdSet(uint16_t OVPThreshold)
+/* Modify OV threshold and verify the calibrated physical value. */
+bool BQ769X0_OVPThresholdSet(uint16_t OVPThreshold)
 {
-	Registers.OVTrip = (uint8_t)((((uint16_t)((OVPThreshold - Adcoffset) / Gain) - OV_THRESH_BASE) >> 4) & 0xFF);
-	BQ769X0_WriteRegisterByteWithCRC(OV_TRIP, Registers.OVTrip);
+	uint16_t actual_mv = 0U;
+
+	return BQ769X0_ProgramTripThreshold(OV_TRIP, OVPThreshold,
+										 BQ769X0_TRIP_OV, &Registers.OVTrip,
+										 &actual_mv);
 }
 
 /* 获取SCD延时 */
@@ -1242,13 +1466,21 @@ BQ769X0_OVDelayTypedef BQ769X0_OVDelayGet(void)
 /* 获取UV阈值(mV) */
 uint16_t BQ769X0_UVPThresholdGet(void)
 {
-	return (uint16_t)(((Registers.UVTrip << 4) + UV_THRESH_BASE) * Gain + Adcoffset);
+	uint16_t actual_mv = 0U;
+
+	(void)BQ769X0_ThresholdDecode(Registers.UVTrip, (uint16_t)iGain,
+										Adcoffset, BQ769X0_TRIP_UV, &actual_mv);
+	return actual_mv;
 }
 
 /* 获取OV阈值(mV) */
 uint16_t BQ769X0_OVPThresholdGet(void)
 {
-	return (uint16_t)(((Registers.OVTrip << 4) + OV_THRESH_BASE) * Gain + Adcoffset);
+	uint16_t actual_mv = 0U;
+
+	(void)BQ769X0_ThresholdDecode(Registers.OVTrip, (uint16_t)iGain,
+										Adcoffset, BQ769X0_TRIP_OV, &actual_mv);
+	return actual_mv;
 }
 
 
@@ -1313,7 +1545,17 @@ uint8_t BQ769X0_VerifyRegisterCRC(uint8_t reg_addr, const char *reg_name)
 /* 完成 BQ 初始化；任一步通信或配置验证失败时返回 false。 */
 bool BQ769X0_Initialize(const BQ769X0_InitDataTypedef *InitData)
 {
+	uint16_t actual_uv_mv = 0U;
+	uint16_t actual_ov_mv = 0U;
+	uint8_t sys_stat = 0U;
+
 	if (InitData == NULL)
+	{
+		return false;
+	}
+
+	/* Runtime leaves DEVICE_XREADY latched; only full init may clear it. */
+	if (!BQ769X0_ClearDeviceForInitialization())
 	{
 		return false;
 	}
@@ -1335,25 +1577,36 @@ bool BQ769X0_Initialize(const BQ769X0_InitDataTypedef *InitData)
 	/* 步骤5: 保存报警回调(上层BMS注册的处理函*/
 	AlertOps = InitData->AlertOps;
 
-	/* 步骤6: 配置保护参数 */
-	Registers.Protect1.Protect1Bit.SCD_THRESH = SCDThresh;
-	Registers.Protect2.Protect2Bit.OCD_THRESH = OCDThresh;
-	Registers.Protect1.Protect1Bit.SCD_DELAY = InitData->ConfigData.SCDDelay;
-	Registers.Protect2.Protect2Bit.OCD_DELAY = InitData->ConfigData.OCDDelay;
-	Registers.Protect3.Protect3Bit.UV_DELAY = InitData->ConfigData.UVDelay;
-	Registers.Protect3.Protect3Bit.OV_DELAY = InitData->ConfigData.OVDelay;
-
-	/* 步骤7: 计算OV/UV阈值寄存器*/
-	/* OV阈14位寄存器格式 [10-XXXX-XXXX-1000], 取中*/
-	Registers.OVTrip = (uint8_t)((((uint16_t)((InitData->ConfigData.OVPThreshold - Adcoffset) / Gain) - OV_THRESH_BASE) >> 4) & 0xFF);
-	/* UV阈14位寄存器格式 [01-XXXX-XXXX-0000], 取中*/
-	Registers.UVTrip = (uint8_t)((((uint16_t)((InitData->ConfigData.UVPThreshold - Adcoffset) / Gain) - UV_THRESH_BASE) >> 4) & 0xFF);
+	/* Steps 6-7: reject thresholds outside this device's calibrated range. */
+	if (!BQ769X0_PrepareProtectionRegisters(&InitData->ConfigData,
+											 &actual_uv_mv, &actual_ov_mv))
+	{
+		return false;
+	}
 
 	/* 步骤8: 写入配置并验*/
 	if (!BQ769X0_Configuration())
 	{
 		return false;
 	}
+	if (!BQ769X0_VerifyTripRegister(UV_TRIP, Registers.UVTrip, actual_uv_mv,
+										BQ769X0_TRIP_UV, &actual_uv_mv) ||
+		!BQ769X0_VerifyTripRegister(OV_TRIP, Registers.OVTrip, actual_ov_mv,
+										BQ769X0_TRIP_OV, &actual_ov_mv))
+	{
+		return false;
+	}
+	if (!BQ769X0_ReadRegisterByteWithCRC(SYS_STAT, &sys_stat) ||
+		((sys_stat & SYS_STAT_DEVICE_BIT) != 0U))
+	{
+		BQ769X0_RUNTIME_PRINTF(
+			"[BQ] DEVICE_XREADY remains active after full initialization\r\n");
+		return false;
+	}
+
+	BQ769X0_RUNTIME_PRINTF(
+		"[BQ] Calibrated thresholds verified: UV=%umV OV=%umV\r\n",
+		(unsigned int)actual_uv_mv, (unsigned int)actual_ov_mv);
 
 	BQ769X0_INFO("BQ769X0 Initialize successful!");
 	return true;

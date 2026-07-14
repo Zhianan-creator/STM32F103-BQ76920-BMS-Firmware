@@ -882,6 +882,9 @@ bool BQ769X0_EntryShip(void);
 /* 检测充电 MOS 关闭时是否存在负载。 */
 bool BQ769X0_LoadDetect(void);
 
+/* Read LOAD_PRESENT with communication status; valid only with CHG off. */
+bool BQ769X0_LoadPresentGet(bool *present);
+
 /*
  * 控制充放电MOS开* 参数:
  *   ControlType - CHG_CONTROL(充电) 或 DSG_CONTROL(放电)
@@ -927,11 +930,11 @@ void BQ769X0_UVDelaySet(BQ769X0_UVDelayTypedef UVDelay);
 /* 设置硬件过压保护延时。 */
 void BQ769X0_OVDelaySet(BQ769X0_OVDelayTypedef OVDelay);
 
-/* 设置硬件欠压保护阈值，单位为毫伏。 */
-void BQ769X0_UVPThresholdSet(uint16_t UVPThreshold);
+/* 设置并回读验证硬件欠压阈值；不可表示或通信失败时返回 false。 */
+bool BQ769X0_UVPThresholdSet(uint16_t UVPThreshold);
 
-/* 设置硬件过压保护阈值，单位为毫伏。 */
-void BQ769X0_OVPThresholdSet(uint16_t OVPThreshold);
+/* 设置并回读验证硬件过压阈值；不可表示或通信失败时返回 false。 */
+bool BQ769X0_OVPThresholdSet(uint16_t OVPThreshold);
 
 /* 获取硬件放电短路保护延时。 */
 BQ769X0_SCDDelayTypedef BQ769X0_SCDDelayGet(void);
@@ -955,7 +958,7 @@ uint16_t BQ769X0_OVPThresholdGet(void);
 /* 从 EXTI ISR 向 ALERT 任务发送通知，不在中断中执行 I2C。 */
 void BQ769X0_AlertNotifyFromISR(void);
 
-/* 在任务上下文读取、分发并清除 SYS_STAT 告警状态。 */
+/* 在任务上下文锁存并处理告警；DEVICE_XREADY 保留到受控重启。 */
 bool BQ769X0_ProcessAlert(void);
 
 
