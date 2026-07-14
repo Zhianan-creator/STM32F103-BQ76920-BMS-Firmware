@@ -200,10 +200,23 @@ void BMS_EnergyChgDsgManage(void)
 void BMS_EnergyBalanceManage(void)
 {
     const BMS_MonitorData_t *mon = BMS_MonitorGetData();
+    const BMS_ProtectState_t *prot = BMS_ProtectGetState();
     uint32_t current_tick = osKernelGetTickCount();
 
-    if (mon == NULL || !mon->data_valid)
+    if (mon == NULL || !mon->data_valid || prot == NULL)
     {
+        return;
+    }
+
+    if (prot->any_active)
+    {
+        if (prot->output_safe_confirmed &&
+            (energy_state.balance_active || (energy_state.balance_mask != 0U)))
+        {
+            energy_state.balance_active = 0U;
+            energy_state.balance_mask = 0U;
+            energy_state.balance_stop_count++;
+        }
         return;
     }
 
@@ -217,11 +230,14 @@ void BMS_EnergyBalanceManage(void)
         {
             /* 均衡运行时间到达限额0s），安全清零所有通道，并进入电压回升等待*/
             energy_state.last_balance_result = BMS_ControlBalanceClear();
-            energy_state.balance_active = 0;
-            energy_state.balance_mask = 0;
-            energy_state.balance_stop_count++;
-            energy_state.balance_rise_until_tick = current_tick + BALANCE_VOLT_RISE_DELAY;
-            BMS_LOGI("ENERGY", "Balance Timer End");
+            if (energy_state.last_balance_result == BMS_CONTROL_OK)
+            {
+                energy_state.balance_active = 0;
+                energy_state.balance_mask = 0;
+                energy_state.balance_stop_count++;
+                energy_state.balance_rise_until_tick = current_tick + BALANCE_VOLT_RISE_DELAY;
+                BMS_LOGI("ENERGY", "Balance Timer End");
+            }
         }
         return;
     }
@@ -311,6 +327,10 @@ void BMS_EnergyBalanceManage(void)
                 energy_state.balance_start_count++;
                 BMS_LOGI("ENERGY", "Balance Start mask=0x%X", (unsigned int)mask);
             }
+            else
+            {
+                energy_state.balance_mask = 0U;
+            }
         }
     }
 }
@@ -339,9 +359,22 @@ void BMS_EnergySetChargeEnable(uint8_t enable)
     energy_state.charge_enable_cmd = enable;
 }
 
-void BMS_EnergySetDischargeEnable(uint8_t enable)
+uint8_t BMS_EnergySetDischargeEnable(uint8_t enable)
 {
-    energy_state.discharge_enable_cmd = enable;
+    if (enable == 0U)
+    {
+        energy_state.discharge_enable_cmd = 0U;
+        return 1U;
+    }
+
+    if (!BMS_ProtectTryRearmDischarge())
+    {
+        energy_state.discharge_enable_cmd = 0U;
+        return 0U;
+    }
+
+    energy_state.discharge_enable_cmd = 1U;
+    return 1U;
 }
 
 void BMS_EnergySetBalanceEnable(uint8_t enable)

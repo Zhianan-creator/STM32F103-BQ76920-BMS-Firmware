@@ -196,6 +196,7 @@ static void BMS_MonitorUpdateSysMode(BMS_MonitorData_t *data)
     }
 }
 
+/* 采集、校验并发布一轮完整的业务监控数据。 */
 int BMS_MonitorUpdate(void)
 {
     BMS_HAL_MonitorData_t hal_data;
@@ -210,6 +211,7 @@ int BMS_MonitorUpdate(void)
         bms_monitor_ctx.data.temp_valid = 0;
         bms_monitor_ctx.data.current_valid = 0;
         bms_monitor_ctx.data.data_valid = 0;
+        bms_monitor_ctx.data.updated = 0;
         BMS_LOGE("MON", "HAL sample failed (err=%lu)",
                (unsigned long)bms_monitor_ctx.error_count);
         return -1;
@@ -279,6 +281,16 @@ int BMS_MonitorUpdate(void)
     bms_monitor_ctx.data.data_valid = (bms_monitor_ctx.data.voltage_valid &&
                                        bms_monitor_ctx.data.temp_valid &&
                                        bms_monitor_ctx.data.current_valid);
+
+    if (!bms_monitor_ctx.data.data_valid)
+    {
+        bms_monitor_ctx.error_count++;
+        bms_monitor_ctx.last_error = -2;
+        bms_monitor_ctx.data.updated = 0;
+        BMS_LOGE("MON", "sample validation failed (err=%lu)",
+                 (unsigned long)bms_monitor_ctx.error_count);
+        return -2;
+    }
                                        
     /* 7. 数值统计分析：计算最大单体、最小单体、压差、平均单体及单体索引 */
     uint16_t max_val = 0;

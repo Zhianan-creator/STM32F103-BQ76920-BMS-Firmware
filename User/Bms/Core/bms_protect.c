@@ -2,457 +2,785 @@
 #include "bms_monitor.h"
 #include "bms_config.h"
 #include "bms_log.h"
-#include "cmsis_os2.h"
-#include "drv_softi2c_bq769x0.h"
 #include "bms_control.h"
-#include <stdio.h>
+#include "drv_softi2c_bq769x0.h"
+#include "cmsis_os2.h"
+#include "FreeRTOS.h"
+#include "task.h"
+#include <string.h>
 
-/* 保护状态结构体，局部静态维*/
-static BMS_ProtectState_t protect_state = {0};
+#define PROTECT_OV_RELEASE_DELTA_MV     50
+#define PROTECT_UV_RELEASE_DELTA_MV     50
+#define PROTECT_OC_RELEASE_DELTA_MA    200
+#define PROTECT_OCD_RECOVERY_MS       3000U
+#define PROTECT_SCD_RECOVERY_MS       3000U
+#define PROTECT_SHUTDOWN_DELAY_MS     5000U
+#define PROTECT_HW_REARM_COOLDOWN_MS  3000U
+#define PROTECT_LOAD_REMOVAL_SAMPLES     3U
+#define PROTECT_LOAD_SAMPLE_INTERVAL_MS 100U
 
-/* 保护阈来自 bms_config.h,转换mV/mA 供整数比较使*/
-static int PROT_OV_MV = 4200;   /* 过压阈4200 mV */
-static int PROT_UV_MV = 3100;   /* 欠压阈3100 mV */
-static int PROT_OCD_MA = 2200;  /* 放电过流阈2200 mA */
-static int PROT_SCD_MA = 8800;  /* 短路阈8800 mA */
-static int PROT_SHUTDOWN_MV = 3080; /* 自动关机电压阈值 3080 mV */
-static uint32_t shutdown_pending_start_tick = 0; /* 严重欠压延迟确认时间戳 */
+#define PROTECT_HW_FAULT_OCD          (1U << 0)
+#define PROTECT_HW_FAULT_SCD          (1U << 1)
+#define PROTECT_HW_FAULT_DEVICE       (1U << 2)
+#define PROTECT_HW_FAULT_OVRD         (1U << 3)
 
-/* 恢复阈值回(回差释放*/
-#define PROTECT_OV_RELEASE_DELTA_MV 50
-#define PROTECT_UV_RELEASE_DELTA_MV 50
-#define PROTECT_OC_RELEASE_DELTA_MA 200
+typedef struct
+{
+    uint8_t active;
+    uint8_t pending;
+    uint8_t recovery_pending;
+    uint32_t pending_tick;
+    uint32_t recovery_tick;
+} BMS_ProtectGuard_t;
 
-/* 软件 De-bounce 延时时间 (ms) */
+typedef enum
+{
+    BMS_GUARD_NO_CHANGE = 0,
+    BMS_GUARD_TRIGGERED,
+    BMS_GUARD_RECOVERED
+} BMS_ProtectTransition_t;
+
+static BMS_ProtectState_t protect_state;
+static BMS_ProtectGuard_t ov_guard;
+static BMS_ProtectGuard_t uv_guard;
+static BMS_ProtectGuard_t ocd_guard;
+static BMS_ProtectGuard_t scd_guard;
+static BMS_ProtectGuard_t occ_guard;
+static BMS_ProtectGuard_t otc_guard;
+static BMS_ProtectGuard_t otd_guard;
+static BMS_ProtectGuard_t ltc_guard;
+static BMS_ProtectGuard_t ltd_guard;
+
+static int PROT_OV_MV = 4200;
+static int PROT_UV_MV = 3100;
+static int PROT_OCD_MA = 2200;
+static int PROT_SCD_MA = 8800;
+static int PROT_SHUTDOWN_MV = 3080;
 static int SOFT_PROT_OV_DELAY_MS = 2000;
 static int SOFT_PROT_UV_DELAY_MS = 4000;
 static int SOFT_PROT_OCD_DELAY_MS = 320;
 static int SOFT_PROT_SCD_DELAY_MS = 1;
 
-/* 自动恢复延时时间 (ms) */
-#define PROTECT_OCD_RECOVERY_DELAY_MS 3000
-#define PROTECT_SCD_RECOVERY_DELAY_MS 3000
+static uint8_t invalid_sample_count;
+static uint8_t recovery_sample_count;
+static uint32_t shutdown_pending_tick;
+static volatile uint8_t hardware_fault_latch;
+static uint32_t hardware_discharge_fault_tick;
 
-/* 延迟确认时间戳变*/
-static uint32_t ov_pending_start_tick = 0;
-static uint32_t uv_pending_start_tick = 0;
-static uint32_t ocd_pending_start_tick = 0;
-static uint32_t scd_pending_start_tick = 0;
-
-/* OCD 自动恢复延迟挂起变量 */
-static uint8_t ocd_recovery_pending = 0;
-static uint32_t ocd_recovery_start_tick = 0;
-
-/* SCD 自动恢复延迟挂起变量 */
-static uint8_t scd_recovery_pending = 0;
-static uint32_t scd_recovery_start_tick = 0;
-
-/* 初始化保护状态变*/
-void BMS_ProtectInit(void)
+/* 更新一个带触发延时、恢复阈值和恢复延时的保护条件。 */
+static BMS_ProtectTransition_t BMS_ProtectUpdateGuard(BMS_ProtectGuard_t *guard,
+                                                       uint8_t trip_condition,
+                                                       uint8_t release_condition,
+                                                       uint32_t trip_delay_ms,
+                                                       uint32_t recovery_delay_ms,
+                                                       uint32_t now)
 {
-    PROT_OV_MV = ((int)(INIT_OV_PROTECT * 1000));
-    PROT_UV_MV = ((int)(INIT_UV_PROTECT * 1000));
-    PROT_OCD_MA = INIT_OCD_PROTECT_CURRENT;
-    PROT_SCD_MA = INIT_SCD_PROTECT_CURRENT;
-    PROT_SHUTDOWN_MV = ((int)(INIT_SHUTDOWN_VOLTAGE * 1000));
+    if (!guard->active)
+    {
+        guard->recovery_pending = 0U;
+        if (!trip_condition)
+        {
+            guard->pending = 0U;
+            return BMS_GUARD_NO_CHANGE;
+        }
 
-    SOFT_PROT_OV_DELAY_MS = 2000;
-    SOFT_PROT_UV_DELAY_MS = 4000;
-    SOFT_PROT_OCD_DELAY_MS = 320;
-    SOFT_PROT_SCD_DELAY_MS = 1;
+        if (!guard->pending)
+        {
+            guard->pending = 1U;
+            guard->pending_tick = now;
+            return BMS_GUARD_NO_CHANGE;
+        }
 
-    protect_state.ov_active = 0;
-    protect_state.uv_active = 0;
-    protect_state.ocd_active = 0;
-    protect_state.scd_active = 0;
-    
-    protect_state.ov_pending = 0;
-    protect_state.uv_pending = 0;
-    protect_state.ocd_pending = 0;
-    protect_state.scd_pending = 0;
-    
-    protect_state.any_active = 0;
-    protect_state.charge_allowed = 1;
-    protect_state.discharge_allowed = 1;
-    protect_state.last_fault = BMS_PROTECT_FAULT_NONE;
-    protect_state.last_fault_cell = 0;
-    protect_state.last_fault_value = 0;
-    protect_state.ov_trigger_count = 0;
-    protect_state.uv_trigger_count = 0;
-    protect_state.ocd_trigger_count = 0;
-    protect_state.scd_trigger_count = 0;
+        if ((uint32_t)(now - guard->pending_tick) >= trip_delay_ms)
+        {
+            guard->active = 1U;
+            guard->pending = 0U;
+            return BMS_GUARD_TRIGGERED;
+        }
+        return BMS_GUARD_NO_CHANGE;
+    }
 
-    ov_pending_start_tick = 0;
-    uv_pending_start_tick = 0;
-    ocd_pending_start_tick = 0;
-    scd_pending_start_tick = 0;
-    shutdown_pending_start_tick = 0;
+    guard->pending = 0U;
+    if (!release_condition)
+    {
+        guard->recovery_pending = 0U;
+        return BMS_GUARD_NO_CHANGE;
+    }
 
-    ocd_recovery_pending = 0;
-    ocd_recovery_start_tick = 0;
-    scd_recovery_pending = 0;
-    scd_recovery_start_tick = 0;
+    if (recovery_delay_ms == 0U)
+    {
+        guard->active = 0U;
+        return BMS_GUARD_RECOVERED;
+    }
+
+    if (!guard->recovery_pending)
+    {
+        guard->recovery_pending = 1U;
+        guard->recovery_tick = now;
+        return BMS_GUARD_NO_CHANGE;
+    }
+
+    if ((uint32_t)(now - guard->recovery_tick) >= recovery_delay_ms)
+    {
+        guard->active = 0U;
+        guard->recovery_pending = 0U;
+        return BMS_GUARD_RECOVERED;
+    }
+    return BMS_GUARD_NO_CHANGE;
 }
 
-/* 根据 Monitor 电参数据更新保护状态机 */
+/* 记录新触发的保护及对应测量值。 */
+static void BMS_ProtectRecordFault(BMS_ProtectFault_t fault,
+                                   uint8_t cell,
+                                   int32_t value,
+                                   uint32_t *counter)
+{
+    protect_state.last_fault = fault;
+    protect_state.last_fault_cell = cell;
+    protect_state.last_fault_value = value;
+    (*counter)++;
+    BMS_LOGE("PROTECT", "%s triggered: value=%ld cell=%u",
+             BMS_ProtectFaultToString(fault), (long)value, (unsigned int)cell);
+}
+
+/* 将内部保护守卫同步到对外状态，并计算充放电许可。 */
+static void BMS_ProtectSyncState(void)
+{
+    protect_state.ov_active = ov_guard.active;
+    protect_state.uv_active = uv_guard.active;
+    protect_state.ocd_active = ocd_guard.active ||
+                               ((hardware_fault_latch & PROTECT_HW_FAULT_OCD) != 0U);
+    protect_state.scd_active = scd_guard.active ||
+                               ((hardware_fault_latch & PROTECT_HW_FAULT_SCD) != 0U);
+    protect_state.occ_active = occ_guard.active;
+    protect_state.otc_active = otc_guard.active;
+    protect_state.otd_active = otd_guard.active;
+    protect_state.ltc_active = ltc_guard.active;
+    protect_state.ltd_active = ltd_guard.active;
+    protect_state.device_fault_active =
+        ((hardware_fault_latch & PROTECT_HW_FAULT_DEVICE) != 0U);
+    protect_state.ovrd_active =
+        ((hardware_fault_latch & PROTECT_HW_FAULT_OVRD) != 0U);
+    protect_state.discharge_rearm_required =
+        ((hardware_fault_latch & (PROTECT_HW_FAULT_OCD | PROTECT_HW_FAULT_SCD)) != 0U);
+    protect_state.device_restart_required = protect_state.device_fault_active;
+
+    protect_state.ov_pending = ov_guard.pending;
+    protect_state.uv_pending = uv_guard.pending;
+    protect_state.ocd_pending = ocd_guard.pending;
+    protect_state.scd_pending = scd_guard.pending;
+    protect_state.occ_pending = occ_guard.pending;
+    protect_state.otc_pending = otc_guard.pending;
+    protect_state.otd_pending = otd_guard.pending;
+    protect_state.ltc_pending = ltc_guard.pending;
+    protect_state.ltd_pending = ltd_guard.pending;
+
+    protect_state.charge_allowed = !(protect_state.ov_active ||
+                                     protect_state.ocd_active ||
+                                     protect_state.scd_active ||
+                                     protect_state.occ_active ||
+                                     protect_state.otc_active ||
+                                     protect_state.ltc_active ||
+                                     protect_state.device_fault_active ||
+                                     protect_state.ovrd_active ||
+                                     protect_state.fail_safe_active ||
+                                     protect_state.shutdown_active);
+    protect_state.discharge_allowed = !(protect_state.uv_active ||
+                                        protect_state.ocd_active ||
+                                        protect_state.scd_active ||
+                                        protect_state.otd_active ||
+                                        protect_state.ltd_active ||
+                                        protect_state.device_fault_active ||
+                                        protect_state.ovrd_active ||
+                                        protect_state.fail_safe_active ||
+                                        protect_state.shutdown_active);
+    protect_state.any_active = !(protect_state.charge_allowed &&
+                                 protect_state.discharge_allowed);
+}
+
+/* 初始化保护阈值、计时器和状态。 */
+void BMS_ProtectInit(void)
+{
+    PROT_OV_MV = (int)(INIT_OV_PROTECT * 1000.0f);
+    PROT_UV_MV = (int)(INIT_UV_PROTECT * 1000.0f);
+    PROT_OCD_MA = INIT_OCD_PROTECT_CURRENT;
+    PROT_SCD_MA = INIT_SCD_PROTECT_CURRENT;
+    PROT_SHUTDOWN_MV = (int)(INIT_SHUTDOWN_VOLTAGE * 1000.0f);
+
+    memset(&protect_state, 0, sizeof(protect_state));
+    memset(&ov_guard, 0, sizeof(ov_guard));
+    memset(&uv_guard, 0, sizeof(uv_guard));
+    memset(&ocd_guard, 0, sizeof(ocd_guard));
+    memset(&scd_guard, 0, sizeof(scd_guard));
+    memset(&occ_guard, 0, sizeof(occ_guard));
+    memset(&otc_guard, 0, sizeof(otc_guard));
+    memset(&otd_guard, 0, sizeof(otd_guard));
+    memset(&ltc_guard, 0, sizeof(ltc_guard));
+    memset(&ltd_guard, 0, sizeof(ltd_guard));
+
+    invalid_sample_count = 0U;
+    recovery_sample_count = 0U;
+    shutdown_pending_tick = 0U;
+    hardware_fault_latch = 0U;
+    hardware_discharge_fault_tick = 0U;
+    protect_state.charge_allowed = 1U;
+    protect_state.discharge_allowed = 1U;
+    protect_state.output_safe_confirmed = 1U;
+}
+
+/* 根据最新监控数据更新全部软件保护，并执行必要的安全关断。 */
 void BMS_ProtectUpdateFromMonitor(void)
 {
     const BMS_MonitorData_t *mon = BMS_MonitorGetData();
+    BMS_ProtectTransition_t transition;
+    uint32_t now = osKernelGetTickCount();
     int32_t discharge_current_ma;
-    int i;
-    static uint32_t invalid_print_counter = 0;
-    uint32_t current_tick = osKernelGetTickCount();
+    int32_t charge_current_ma;
+    int16_t min_temp_c;
+    int16_t max_temp_c;
+    uint8_t ov_cell = 0U;
+    uint8_t uv_cell = 0U;
+    uint8_t i;
 
-    if (mon == NULL || !mon->data_valid)
+    if (protect_state.shutdown_active)
     {
-        if (invalid_print_counter % 10 == 0)
-        {
-            BMS_LOGW("PROTECT", "monitor data invalid, skip update");
-        }
-        invalid_print_counter++;
         return;
     }
-    invalid_print_counter = 0; /* Reset counter when valid */
 
-    /* Only negative current is discharge; charge or idle current must not trigger OCD/SCD. */
+    if ((mon == NULL) || !mon->data_valid)
+    {
+        recovery_sample_count = 0U;
+        if (invalid_sample_count < BMS_MONITOR_FAIL_SAFE_COUNT)
+        {
+            invalid_sample_count++;
+        }
+
+        if (invalid_sample_count >= BMS_MONITOR_FAIL_SAFE_COUNT)
+        {
+            if (!protect_state.fail_safe_active)
+            {
+                protect_state.fail_safe_active = 1U;
+                BMS_ProtectRecordFault(BMS_PROTECT_FAULT_MONITOR, 0U, -1,
+                                       &protect_state.fail_safe_trigger_count);
+            }
+            if (!protect_state.safe_off_confirmed)
+            {
+                protect_state.safe_off_confirmed =
+                    BQ769X0_ForceSafeOff(BMS_SAFE_OFF_RETRY_COUNT) ? 1U : 0U;
+            }
+        }
+
+        BMS_ProtectSyncState();
+        protect_state.output_safe_confirmed =
+            BMS_ControlApplyProtectState(&protect_state);
+        if (protect_state.fail_safe_active && !protect_state.safe_off_confirmed)
+        {
+            protect_state.output_safe_confirmed = 0U;
+        }
+        return;
+    }
+
+    invalid_sample_count = 0U;
+    if (protect_state.fail_safe_active)
+    {
+        recovery_sample_count++;
+        if (recovery_sample_count < BMS_MONITOR_RECOVERY_COUNT)
+        {
+            BMS_ProtectSyncState();
+            protect_state.output_safe_confirmed =
+                BMS_ControlApplyProtectState(&protect_state);
+            if (!protect_state.safe_off_confirmed)
+            {
+                protect_state.output_safe_confirmed = 0U;
+            }
+            return;
+        }
+        protect_state.fail_safe_active = 0U;
+        protect_state.safe_off_confirmed = 0U;
+        recovery_sample_count = 0U;
+        BMS_LOGI("PROTECT", "monitor fail-safe recovered");
+    }
+
     discharge_current_ma = (mon->current_ma < 0) ? -mon->current_ma : 0;
+    charge_current_ma = (mon->current_ma > 0) ? mon->current_ma : 0;
+    min_temp_c = mon->temp_c[0];
+    max_temp_c = mon->temp_c[0];
 
-    // ==================== 1. OV: 单体过压 ====================
-    if (!protect_state.ov_active)
+    for (i = 0U; i < mon->cell_count; i++)
     {
-        int fault_cell = -1;
-        uint16_t fault_mv = 0;
-        for (i = 0; i < mon->cell_count; i++)
+        if ((ov_cell == 0U) && (mon->cell_mv[i] >= (uint16_t)PROT_OV_MV))
         {
-            if (mon->cell_mv[i] >= PROT_OV_MV)
-            {
-                fault_cell = i + 1;
-                fault_mv = mon->cell_mv[i];
-                break;
-            }
+            ov_cell = (uint8_t)(i + 1U);
         }
-        if (fault_cell >= 0)
+        if ((uv_cell == 0U) && (mon->cell_mv[i] <= (uint16_t)PROT_UV_MV))
         {
-            if (!protect_state.ov_pending)
-            {
-                protect_state.ov_pending = 1;
-                ov_pending_start_tick = current_tick;
-                BMS_LOGW("PROTECT", "OV Pending: Cell%d %dmV", fault_cell, fault_mv);
-            }
-            else
-            {
-                if (current_tick - ov_pending_start_tick >= SOFT_PROT_OV_DELAY_MS)
-                {
-                    protect_state.ov_active = 1;
-                    protect_state.ov_pending = 0;
-                    protect_state.last_fault = BMS_PROTECT_FAULT_OV;
-                    protect_state.last_fault_cell = fault_cell;
-                    protect_state.last_fault_value = fault_mv;
-                    protect_state.ov_trigger_count++;
-                    BMS_LOGE("PROTECT", "OV Triggered: Cell%d %d mV >= %d mV", 
-                           fault_cell, fault_mv, PROT_OV_MV);
-                }
-            }
-        }
-        else
-        {
-            protect_state.ov_pending = 0;
+            uv_cell = (uint8_t)(i + 1U);
         }
     }
-    else
+    for (i = 1U; i < mon->temp_count; i++)
     {
-        if (mon->max_cell_mv <= (PROT_OV_MV - PROTECT_OV_RELEASE_DELTA_MV))
+        if (mon->temp_c[i] < min_temp_c)
         {
-            protect_state.ov_active = 0;
-            BMS_LOGI("PROTECT", "OV Auto recovered");
+            min_temp_c = mon->temp_c[i];
+        }
+        if (mon->temp_c[i] > max_temp_c)
+        {
+            max_temp_c = mon->temp_c[i];
         }
     }
 
-    // ==================== 2. UV: 单体欠压 ====================
-    if (!protect_state.uv_active)
+    transition = BMS_ProtectUpdateGuard(&ov_guard, ov_cell != 0U,
+                                        mon->max_cell_mv <= (PROT_OV_MV - PROTECT_OV_RELEASE_DELTA_MV),
+                                        (uint32_t)SOFT_PROT_OV_DELAY_MS, 0U, now);
+    if (transition == BMS_GUARD_TRIGGERED)
     {
-        int fault_cell = -1;
-        uint16_t fault_mv = 0;
-        for (i = 0; i < mon->cell_count; i++)
-        {
-            if (mon->cell_mv[i] <= PROT_UV_MV)
-            {
-                fault_cell = i + 1;
-                fault_mv = mon->cell_mv[i];
-                break;
-            }
-        }
-        if (fault_cell >= 0)
-        {
-            if (!protect_state.uv_pending)
-            {
-                protect_state.uv_pending = 1;
-                uv_pending_start_tick = current_tick;
-                BMS_LOGW("PROTECT", "UV Pending: Cell%d %dmV", fault_cell, fault_mv);
-            }
-            else
-            {
-                if (current_tick - uv_pending_start_tick >= SOFT_PROT_UV_DELAY_MS)
-                {
-                    protect_state.uv_active = 1;
-                    protect_state.uv_pending = 0;
-                    protect_state.last_fault = BMS_PROTECT_FAULT_UV;
-                    protect_state.last_fault_cell = fault_cell;
-                    protect_state.last_fault_value = fault_mv;
-                    protect_state.uv_trigger_count++;
-                    BMS_LOGE("PROTECT", "UV Triggered: Cell%d %d mV <= %d mV", 
-                           fault_cell, fault_mv, PROT_UV_MV);
-                }
-            }
-        }
-        else
-        {
-            protect_state.uv_pending = 0;
-        }
+        BMS_ProtectRecordFault(BMS_PROTECT_FAULT_OV, ov_cell,
+                               mon->cell_mv[ov_cell - 1U], &protect_state.ov_trigger_count);
     }
-    else
+    else if (transition == BMS_GUARD_RECOVERED)
     {
-        if (mon->min_cell_mv >= (PROT_UV_MV + PROTECT_UV_RELEASE_DELTA_MV))
-        {
-            protect_state.uv_active = 0;
-            BMS_LOGI("PROTECT", "UV Auto recovered");
-        }
+        BMS_LOGI("PROTECT", "OV recovered");
     }
 
-    // ==================== 3. OCD: 放电过流 ====================
-    if (!protect_state.ocd_active)
+    transition = BMS_ProtectUpdateGuard(&uv_guard, uv_cell != 0U,
+                                        mon->min_cell_mv >= (PROT_UV_MV + PROTECT_UV_RELEASE_DELTA_MV),
+                                        (uint32_t)SOFT_PROT_UV_DELAY_MS, 0U, now);
+    if (transition == BMS_GUARD_TRIGGERED)
     {
-        if (discharge_current_ma >= PROT_OCD_MA)
-        {
-            if (!protect_state.ocd_pending)
-            {
-                protect_state.ocd_pending = 1;
-                ocd_pending_start_tick = current_tick;
-                BMS_LOGW("PROTECT", "OCD Pending: %dmA", (int)discharge_current_ma);
-            }
-            else
-            {
-                if (current_tick - ocd_pending_start_tick >= SOFT_PROT_OCD_DELAY_MS)
-                {
-                    protect_state.ocd_active = 1;
-                    protect_state.ocd_pending = 0;
-                    protect_state.last_fault = BMS_PROTECT_FAULT_OCD;
-                    protect_state.last_fault_cell = 0;
-                    protect_state.last_fault_value = discharge_current_ma;
-                    protect_state.ocd_trigger_count++;
-                    BMS_LOGE("PROTECT", "OCD Triggered: Current %d mA >= %d mA", 
-                           (int)discharge_current_ma, PROT_OCD_MA);
-                }
-            }
-        }
-        else
-        {
-            protect_state.ocd_pending = 0;
-        }
+        BMS_ProtectRecordFault(BMS_PROTECT_FAULT_UV, uv_cell,
+                               mon->cell_mv[uv_cell - 1U], &protect_state.uv_trigger_count);
     }
-    else
+    else if (transition == BMS_GUARD_RECOVERED)
     {
-        if (discharge_current_ma <= (PROT_OCD_MA - PROTECT_OC_RELEASE_DELTA_MA))
-        {
-            if (!ocd_recovery_pending)
-            {
-                ocd_recovery_pending = 1;
-                ocd_recovery_start_tick = current_tick;
-            }
-            else
-            {
-                if (current_tick - ocd_recovery_start_tick >= PROTECT_OCD_RECOVERY_DELAY_MS)
-                {
-                    protect_state.ocd_active = 0;
-                    ocd_recovery_pending = 0;
-                    BMS_LOGI("PROTECT", "OCD Auto recovered");
-                }
-            }
-        }
-        else
-        {
-            ocd_recovery_pending = 0;
-        }
+        BMS_LOGI("PROTECT", "UV recovered");
     }
 
-    // ==================== 4. SCD: 短路/严重过流 ====================
-    if (!protect_state.scd_active)
+    transition = BMS_ProtectUpdateGuard(&ocd_guard,
+                                        discharge_current_ma >= PROT_OCD_MA,
+                                        discharge_current_ma <= (PROT_OCD_MA - PROTECT_OC_RELEASE_DELTA_MA),
+                                        (uint32_t)SOFT_PROT_OCD_DELAY_MS,
+                                        PROTECT_OCD_RECOVERY_MS, now);
+    if (transition == BMS_GUARD_TRIGGERED)
     {
-        if (discharge_current_ma >= PROT_SCD_MA)
-        {
-            if (!protect_state.scd_pending)
-            {
-                protect_state.scd_pending = 1;
-                scd_pending_start_tick = current_tick;
-                BMS_LOGW("PROTECT", "SCD Pending: %dmA", (int)discharge_current_ma);
-            }
-            else
-            {
-                if (current_tick - scd_pending_start_tick >= SOFT_PROT_SCD_DELAY_MS)
-                {
-                    protect_state.scd_active = 1;
-                    protect_state.scd_pending = 0;
-                    protect_state.last_fault = BMS_PROTECT_FAULT_SCD;
-                    protect_state.last_fault_cell = 0;
-                    protect_state.last_fault_value = discharge_current_ma;
-                    protect_state.scd_trigger_count++;
-                    BMS_LOGE("PROTECT", "SCD Triggered: Current %d mA >= %d mA", 
-                           (int)discharge_current_ma, PROT_SCD_MA);
-                }
-            }
-        }
-        else
-        {
-            protect_state.scd_pending = 0;
-        }
+        BMS_ProtectRecordFault(BMS_PROTECT_FAULT_OCD, 0U, discharge_current_ma,
+                               &protect_state.ocd_trigger_count);
     }
-    else
+    else if (transition == BMS_GUARD_RECOVERED)
     {
-        if (discharge_current_ma <= (PROT_SCD_MA - PROTECT_OC_RELEASE_DELTA_MA))
-        {
-            if (!scd_recovery_pending)
-            {
-                scd_recovery_pending = 1;
-                scd_recovery_start_tick = current_tick;
-            }
-            else
-            {
-                if (current_tick - scd_recovery_start_tick >= PROTECT_SCD_RECOVERY_DELAY_MS)
-                {
-                    protect_state.scd_active = 0;
-                    scd_recovery_pending = 0;
-                    BMS_LOGI("PROTECT", "SCD Auto recovered");
-                }
-            }
-        }
-        else
-        {
-            scd_recovery_pending = 0;
-        }
+        BMS_LOGI("PROTECT", "OCD recovered");
     }
 
-    // ==================== 4.5. CRITICAL UV SHUTDOWN (SHIP MODE) ====================
-    if (mon->min_cell_mv <= PROT_SHUTDOWN_MV)
+    transition = BMS_ProtectUpdateGuard(&scd_guard,
+                                        discharge_current_ma >= PROT_SCD_MA,
+                                        discharge_current_ma <= (PROT_SCD_MA - PROTECT_OC_RELEASE_DELTA_MA),
+                                        (uint32_t)SOFT_PROT_SCD_DELAY_MS,
+                                        PROTECT_SCD_RECOVERY_MS, now);
+    if (transition == BMS_GUARD_TRIGGERED)
     {
-        if (shutdown_pending_start_tick == 0)
+        BMS_ProtectRecordFault(BMS_PROTECT_FAULT_SCD, 0U, discharge_current_ma,
+                               &protect_state.scd_trigger_count);
+    }
+    else if (transition == BMS_GUARD_RECOVERED)
+    {
+        BMS_LOGI("PROTECT", "SCD recovered");
+    }
+
+    transition = BMS_ProtectUpdateGuard(&occ_guard,
+                                        charge_current_ma >= INIT_OCC_PROTECT_MA,
+                                        charge_current_ma <= INIT_OCC_RELEASE_MA,
+                                        INIT_OCC_DELAY_MS, INIT_OCC_RECOVERY_MS, now);
+    if (transition == BMS_GUARD_TRIGGERED)
+    {
+        BMS_ProtectRecordFault(BMS_PROTECT_FAULT_OCC, 0U, charge_current_ma,
+                               &protect_state.occ_trigger_count);
+    }
+    else if (transition == BMS_GUARD_RECOVERED)
+    {
+        BMS_LOGI("PROTECT", "OCC recovered");
+    }
+
+    transition = BMS_ProtectUpdateGuard(&otc_guard,
+                                        max_temp_c >= INIT_OTC_PROTECT_C,
+                                        max_temp_c <= INIT_OTC_RELEASE_C,
+                                        INIT_TEMP_DELAY_MS, INIT_TEMP_RECOVERY_MS, now);
+    if (transition == BMS_GUARD_TRIGGERED)
+    {
+        BMS_ProtectRecordFault(BMS_PROTECT_FAULT_OTC, 0U, max_temp_c,
+                               &protect_state.otc_trigger_count);
+    }
+    else if (transition == BMS_GUARD_RECOVERED)
+    {
+        BMS_LOGI("PROTECT", "OTC recovered");
+    }
+
+    transition = BMS_ProtectUpdateGuard(&otd_guard,
+                                        max_temp_c >= INIT_OTD_PROTECT_C,
+                                        max_temp_c <= INIT_OTD_RELEASE_C,
+                                        INIT_TEMP_DELAY_MS, INIT_TEMP_RECOVERY_MS, now);
+    if (transition == BMS_GUARD_TRIGGERED)
+    {
+        BMS_ProtectRecordFault(BMS_PROTECT_FAULT_OTD, 0U, max_temp_c,
+                               &protect_state.otd_trigger_count);
+    }
+    else if (transition == BMS_GUARD_RECOVERED)
+    {
+        BMS_LOGI("PROTECT", "OTD recovered");
+    }
+
+    transition = BMS_ProtectUpdateGuard(&ltc_guard,
+                                        min_temp_c <= INIT_LTC_PROTECT_C,
+                                        min_temp_c >= INIT_LTC_RELEASE_C,
+                                        INIT_TEMP_DELAY_MS, INIT_TEMP_RECOVERY_MS, now);
+    if (transition == BMS_GUARD_TRIGGERED)
+    {
+        BMS_ProtectRecordFault(BMS_PROTECT_FAULT_LTC, 0U, min_temp_c,
+                               &protect_state.ltc_trigger_count);
+    }
+    else if (transition == BMS_GUARD_RECOVERED)
+    {
+        BMS_LOGI("PROTECT", "LTC recovered");
+    }
+
+    transition = BMS_ProtectUpdateGuard(&ltd_guard,
+                                        min_temp_c <= INIT_LTD_PROTECT_C,
+                                        min_temp_c >= INIT_LTD_RELEASE_C,
+                                        INIT_TEMP_DELAY_MS, INIT_TEMP_RECOVERY_MS, now);
+    if (transition == BMS_GUARD_TRIGGERED)
+    {
+        BMS_ProtectRecordFault(BMS_PROTECT_FAULT_LTD, 0U, min_temp_c,
+                               &protect_state.ltd_trigger_count);
+    }
+    else if (transition == BMS_GUARD_RECOVERED)
+    {
+        BMS_LOGI("PROTECT", "LTD recovered");
+    }
+
+    BMS_ProtectSyncState();
+    protect_state.output_safe_confirmed =
+        BMS_ControlApplyProtectState(&protect_state);
+
+    if (mon->min_cell_mv <= (uint16_t)PROT_SHUTDOWN_MV)
+    {
+        if (shutdown_pending_tick == 0U)
         {
-            shutdown_pending_start_tick = current_tick;
-            BMS_LOGW("PROTECT", "CRITICAL UNDER-VOLTAGE PENDING: Min Cell %dmV <= Shutdown %dmV", 
-                     (int)mon->min_cell_mv, PROT_SHUTDOWN_MV);
+            shutdown_pending_tick = now;
         }
-        else
+        else if ((uint32_t)(now - shutdown_pending_tick) >= PROTECT_SHUTDOWN_DELAY_MS)
         {
-            if (current_tick - shutdown_pending_start_tick >= 5000)
+            if (BQ769X0_ForceSafeOff(BMS_SAFE_OFF_RETRY_COUNT))
             {
-                BMS_LOGE("PROTECT", "CRITICAL UNDER-VOLTAGE TRIGGERED! Entering SHIP mode to prevent battery damage.");
-                osDelay(100);
-                BQ769X0_ForceSafeOff();
-                BQ769X0_EntryShip();
+                if (BQ769X0_EntryShip())
+                {
+                    BMS_ProtectLatchShutdown();
+                }
             }
         }
     }
     else
     {
-        shutdown_pending_start_tick = 0;
+        shutdown_pending_tick = 0U;
     }
-
-    /* 5. 更新总保护状态和允许状*/
-    protect_state.charge_allowed = (protect_state.ov_active == 0);
-    protect_state.discharge_allowed = (protect_state.uv_active == 0 &&
-                                       protect_state.ocd_active == 0 &&
-                                       protect_state.scd_active == 0);
-    protect_state.any_active = (protect_state.ov_active || 
-                                protect_state.uv_active || 
-                                protect_state.ocd_active || 
-                                protect_state.scd_active);
-
-    /* 6. 联动底层控制，一有故障，物理瞬间断开 */
-    BMS_ControlApplyProtectState(&protect_state);
 }
 
-/* 获取当前保护状态结构体常量指针 */
+/* 锁存已进入 Ship 模式的终止状态，禁止后续重新开启 MOS。 */
+void BMS_ProtectLatchShutdown(void)
+{
+    protect_state.shutdown_active = 1U;
+    protect_state.safe_off_confirmed = 1U;
+    BMS_ProtectSyncState();
+    protect_state.output_safe_confirmed = 1U;
+    BMS_LOGW("PROTECT", "shutdown latched");
+}
+
+/* Persist a hardware fault before the driver clears its W1C status bit. */
+void BMS_ProtectLatchHardwareFault(BMS_ProtectFault_t fault)
+{
+    const BMS_MonitorData_t *mon = BMS_MonitorGetData();
+    int32_t value = -1;
+    uint8_t cell = 0U;
+    uint8_t newly_latched = 0U;
+    uint32_t now = osKernelGetTickCount();
+
+    if ((mon != NULL) && mon->data_valid)
+    {
+        if (fault == BMS_PROTECT_FAULT_OV)
+        {
+            value = mon->max_cell_mv;
+        }
+        else if (fault == BMS_PROTECT_FAULT_UV)
+        {
+            value = mon->min_cell_mv;
+        }
+        else if ((fault == BMS_PROTECT_FAULT_OCD) ||
+                 (fault == BMS_PROTECT_FAULT_SCD))
+        {
+            value = (mon->current_ma < 0) ? -mon->current_ma : mon->current_ma;
+        }
+    }
+
+    taskENTER_CRITICAL();
+    switch (fault)
+    {
+        case BMS_PROTECT_FAULT_OV:
+            if (!ov_guard.active)
+            {
+                ov_guard.active = 1U;
+                ov_guard.pending = 0U;
+                protect_state.ov_trigger_count++;
+                newly_latched = 1U;
+            }
+            break;
+
+        case BMS_PROTECT_FAULT_UV:
+            if (!uv_guard.active)
+            {
+                uv_guard.active = 1U;
+                uv_guard.pending = 0U;
+                protect_state.uv_trigger_count++;
+                newly_latched = 1U;
+            }
+            break;
+
+        case BMS_PROTECT_FAULT_OCD:
+            /* Every repeated trip restarts the cooldown from the latest event. */
+            hardware_discharge_fault_tick = now;
+            if ((hardware_fault_latch & PROTECT_HW_FAULT_OCD) == 0U)
+            {
+                hardware_fault_latch |= PROTECT_HW_FAULT_OCD;
+                protect_state.ocd_trigger_count++;
+                newly_latched = 1U;
+            }
+            break;
+
+        case BMS_PROTECT_FAULT_SCD:
+            /* Every repeated trip restarts the cooldown from the latest event. */
+            hardware_discharge_fault_tick = now;
+            if ((hardware_fault_latch & PROTECT_HW_FAULT_SCD) == 0U)
+            {
+                hardware_fault_latch |= PROTECT_HW_FAULT_SCD;
+                protect_state.scd_trigger_count++;
+                newly_latched = 1U;
+            }
+            break;
+
+        case BMS_PROTECT_FAULT_DEVICE:
+            if ((hardware_fault_latch & PROTECT_HW_FAULT_DEVICE) == 0U)
+            {
+                hardware_fault_latch |= PROTECT_HW_FAULT_DEVICE;
+                protect_state.device_trigger_count++;
+                newly_latched = 1U;
+            }
+            break;
+
+        case BMS_PROTECT_FAULT_OVRD:
+            if ((hardware_fault_latch & PROTECT_HW_FAULT_OVRD) == 0U)
+            {
+                hardware_fault_latch |= PROTECT_HW_FAULT_OVRD;
+                protect_state.ovrd_trigger_count++;
+                newly_latched = 1U;
+            }
+            break;
+
+        default:
+            break;
+    }
+
+    if (newly_latched)
+    {
+        protect_state.last_fault = fault;
+        protect_state.last_fault_cell = cell;
+        protect_state.last_fault_value = value;
+    }
+    BMS_ProtectSyncState();
+    taskEXIT_CRITICAL();
+
+    /* Execute the safety action before any potentially blocking UART log. */
+    protect_state.output_safe_confirmed =
+        BMS_ControlApplyProtectState(&protect_state);
+    if (newly_latched)
+    {
+        BMS_LOGE("PROTECT", "HW %s latched before SYS_STAT clear",
+                 BMS_ProtectFaultToString(fault));
+    }
+}
+
+/* Explicit OCD/SCD rearm: cooldown, safe-off, load removal, then clear latch. */
+uint8_t BMS_ProtectTryRearmDischarge(void)
+{
+    uint8_t latch_snapshot;
+    uint8_t allowed;
+    uint8_t result = 0U;
+    uint8_t sys_stat = 0U;
+    uint8_t sample_index;
+    bool load_present = false;
+    uint32_t now = osKernelGetTickCount();
+    uint32_t fault_tick_snapshot;
+
+    taskENTER_CRITICAL();
+    latch_snapshot = hardware_fault_latch;
+    fault_tick_snapshot = hardware_discharge_fault_tick;
+    taskEXIT_CRITICAL();
+
+    if ((latch_snapshot & (PROTECT_HW_FAULT_DEVICE | PROTECT_HW_FAULT_OVRD)) != 0U)
+    {
+        return 0U;
+    }
+    if ((latch_snapshot & (PROTECT_HW_FAULT_OCD | PROTECT_HW_FAULT_SCD)) == 0U)
+    {
+        return BMS_ProtectIsDischargeAllowed();
+    }
+    if ((uint32_t)(now - fault_tick_snapshot) <
+        PROTECT_HW_REARM_COOLDOWN_MS)
+    {
+        return 0U;
+    }
+
+    for (sample_index = 0U;
+         sample_index < PROTECT_LOAD_REMOVAL_SAMPLES;
+         sample_index++)
+    {
+        load_present = false;
+        sys_stat = 0U;
+        BQ769X0_BusLock();
+        if (!BQ769X0_ForceSafeOff(BMS_SAFE_OFF_RETRY_COUNT) ||
+            !BQ769X0_LoadPresentGet(&load_present) || load_present ||
+            !BQ769X0_ReadRegisterByteWithCRC(SYS_STAT, &sys_stat) ||
+            ((sys_stat & (SYS_STAT_OCD_BIT | SYS_STAT_SCD_BIT |
+                          SYS_STAT_OV_BIT | SYS_STAT_UV_BIT |
+                          SYS_STAT_OVRD_BIT | SYS_STAT_DEVICE_BIT)) != 0U))
+        {
+            goto out;
+        }
+
+        if ((sample_index + 1U) < PROTECT_LOAD_REMOVAL_SAMPLES)
+        {
+            BQ769X0_BusUnlock();
+            osDelay(PROTECT_LOAD_SAMPLE_INTERVAL_MS);
+        }
+    }
+
+    taskENTER_CRITICAL();
+    if ((hardware_fault_latch == latch_snapshot) &&
+        (hardware_discharge_fault_tick == fault_tick_snapshot))
+    {
+        hardware_fault_latch &=
+            (uint8_t)~(PROTECT_HW_FAULT_OCD | PROTECT_HW_FAULT_SCD);
+        BMS_ProtectSyncState();
+        allowed = protect_state.discharge_allowed;
+    }
+    else
+    {
+        allowed = 0U;
+    }
+    taskEXIT_CRITICAL();
+
+    result = allowed;
+
+out:
+    BQ769X0_BusUnlock();
+    if (result)
+    {
+        BMS_LOGI("PROTECT", "HW discharge fault rearmed after stable load removal");
+    }
+    return result;
+}
+
+/* 获取当前保护状态的只读指针。 */
 const BMS_ProtectState_t *BMS_ProtectGetState(void)
 {
     return &protect_state;
 }
 
-/* 查询是否有任何保护被激*/
-uint8_t BMS_ProtectIsAnyActive(void)
-{
-    return protect_state.any_active;
-}
+/* 查询是否存在任一激活的保护。 */
+uint8_t BMS_ProtectIsAnyActive(void) { return protect_state.any_active; }
 
-/* 查询过压保护状*/
-uint8_t BMS_ProtectIsOvActive(void)
-{
-    return protect_state.ov_active;
-}
+/* 查询单体过压保护是否激活。 */
+uint8_t BMS_ProtectIsOvActive(void) { return protect_state.ov_active; }
 
-/* 查询欠压保护状*/
-uint8_t BMS_ProtectIsUvActive(void)
-{
-    return protect_state.uv_active;
-}
+/* 查询单体欠压保护是否激活。 */
+uint8_t BMS_ProtectIsUvActive(void) { return protect_state.uv_active; }
 
-/* 查询放电过流保护状*/
-uint8_t BMS_ProtectIsOcdActive(void)
-{
-    return protect_state.ocd_active;
-}
+/* 查询放电过流保护是否激活。 */
+uint8_t BMS_ProtectIsOcdActive(void) { return protect_state.ocd_active; }
 
-/* 查询短路保护状*/
-uint8_t BMS_ProtectIsScdActive(void)
-{
-    return protect_state.scd_active;
-}
+/* 查询放电短路保护是否激活。 */
+uint8_t BMS_ProtectIsScdActive(void) { return protect_state.scd_active; }
 
-/* 查询是否允许充电 */
-uint8_t BMS_ProtectIsChargeAllowed(void)
-{
-    return protect_state.charge_allowed;
-}
+/* 查询当前是否允许充电。 */
+uint8_t BMS_ProtectIsChargeAllowed(void) { return protect_state.charge_allowed; }
 
-/* 查询是否允许放电 */
-uint8_t BMS_ProtectIsDischargeAllowed(void)
-{
-    return protect_state.discharge_allowed;
-}
+/* 查询当前是否允许放电。 */
+uint8_t BMS_ProtectIsDischargeAllowed(void) { return protect_state.discharge_allowed; }
 
-/* 获取最近一次触发故*/
-BMS_ProtectFault_t BMS_ProtectGetLastFault(void)
-{
-    return protect_state.last_fault;
-}
+/* 获取最近一次触发的保护类型。 */
+BMS_ProtectFault_t BMS_ProtectGetLastFault(void) { return protect_state.last_fault; }
 
-/* 将保护类型转换为字符*/
+/* 将保护类型转换为便于日志显示的字符串。 */
 const char *BMS_ProtectFaultToString(BMS_ProtectFault_t fault)
 {
     switch (fault)
     {
-        case BMS_PROTECT_FAULT_NONE: return "NONE";
-        case BMS_PROTECT_FAULT_OV:   return "OV";
-        case BMS_PROTECT_FAULT_UV:   return "UV";
-        case BMS_PROTECT_FAULT_OCD:  return "OCD";
-        case BMS_PROTECT_FAULT_SCD:  return "SCD";
-        default:                     return "UNKNOWN";
+        case BMS_PROTECT_FAULT_NONE:    return "NONE";
+        case BMS_PROTECT_FAULT_OV:      return "OV";
+        case BMS_PROTECT_FAULT_UV:      return "UV";
+        case BMS_PROTECT_FAULT_OCD:     return "OCD";
+        case BMS_PROTECT_FAULT_SCD:     return "SCD";
+        case BMS_PROTECT_FAULT_OCC:     return "OCC";
+        case BMS_PROTECT_FAULT_OTC:     return "OTC";
+        case BMS_PROTECT_FAULT_OTD:     return "OTD";
+        case BMS_PROTECT_FAULT_LTC:     return "LTC";
+        case BMS_PROTECT_FAULT_LTD:     return "LTD";
+        case BMS_PROTECT_FAULT_DEVICE:  return "DEVICE_XREADY";
+        case BMS_PROTECT_FAULT_OVRD:    return "OVRD_ALERT";
+        case BMS_PROTECT_FAULT_MONITOR: return "MONITOR";
+        default:                        return "UNKNOWN";
     }
 }
 
-/* 动态保护限额及延时修改器与获取器 */
+/* 设置单体过压阈值，单位为毫伏。 */
 void BMS_ProtectSetOVMv(int ov_mv) { PROT_OV_MV = ov_mv; }
+
+/* 设置单体欠压阈值，单位为毫伏。 */
 void BMS_ProtectSetUVMv(int uv_mv) { PROT_UV_MV = uv_mv; }
+
+/* 设置放电过流阈值，单位为毫安。 */
 void BMS_ProtectSetOCDMa(int ocd_ma) { PROT_OCD_MA = ocd_ma; }
+
+/* 设置放电短路阈值，单位为毫安。 */
 void BMS_ProtectSetSCDMa(int scd_ma) { PROT_SCD_MA = scd_ma; }
+
+/* 设置单体过压确认延时，单位为毫秒。 */
 void BMS_ProtectSetOVDelayMs(int delay_ms) { SOFT_PROT_OV_DELAY_MS = delay_ms; }
+
+/* 设置单体欠压确认延时，单位为毫秒。 */
 void BMS_ProtectSetUVDelayMs(int delay_ms) { SOFT_PROT_UV_DELAY_MS = delay_ms; }
+
+/* 设置放电过流确认延时，单位为毫秒。 */
 void BMS_ProtectSetOCDDelayMs(int delay_ms) { SOFT_PROT_OCD_DELAY_MS = delay_ms; }
+
+/* 设置放电短路确认延时，单位为毫秒。 */
 void BMS_ProtectSetSCDDelayMs(int delay_ms) { SOFT_PROT_SCD_DELAY_MS = delay_ms; }
 
+/* 获取单体过压阈值，单位为毫伏。 */
 int BMS_ProtectGetOVMv(void) { return PROT_OV_MV; }
+
+/* 获取单体欠压阈值，单位为毫伏。 */
 int BMS_ProtectGetUVMv(void) { return PROT_UV_MV; }
+
+/* 获取放电过流阈值，单位为毫安。 */
 int BMS_ProtectGetOCDMa(void) { return PROT_OCD_MA; }
+
+/* 获取放电短路阈值，单位为毫安。 */
 int BMS_ProtectGetSCDMa(void) { return PROT_SCD_MA; }
+
+/* 获取单体过压确认延时，单位为毫秒。 */
 int BMS_ProtectGetOVDelayMs(void) { return SOFT_PROT_OV_DELAY_MS; }
+
+/* 获取单体欠压确认延时，单位为毫秒。 */
 int BMS_ProtectGetUVDelayMs(void) { return SOFT_PROT_UV_DELAY_MS; }
+
+/* 获取放电过流确认延时，单位为毫秒。 */
 int BMS_ProtectGetOCDDelayMs(void) { return SOFT_PROT_OCD_DELAY_MS; }
+
+/* 获取放电短路确认延时，单位为毫秒。 */
 int BMS_ProtectGetSCDDelayMs(void) { return SOFT_PROT_SCD_DELAY_MS; }

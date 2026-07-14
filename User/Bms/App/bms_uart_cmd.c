@@ -5,6 +5,8 @@
 #include "bms_analysis.h"
 #include "bms_energy.h"
 #include "bms_can_task.h"
+#include "bms_config.h"
+#include "bms_init.h"
 #include "FreeRTOS.h"
 #include "queue.h"
 #include "task.h"
@@ -249,9 +251,14 @@ static void Cmd_SetParam(const char *param, int value)
             printf("[CMD] ERROR: UVP threshold must be between 1000mV and 4000mV\r\n");
             return;
         }
-        BQ769X0_UVPThresholdSet((uint16_t)value);
+        if (!BQ769X0_UVPThresholdSet((uint16_t)value))
+        {
+            printf("[CMD] ERROR: UVP is outside calibrated HW range or readback failed\r\n");
+            return;
+        }
         BMS_ProtectSetUVMv(value);
-        printf("[CMD] UVP threshold set to %dmV (HW & SW synchronized)\r\n", value);
+        printf("[CMD] UVP requested=%dmV, HW actual=%umV, SW synchronized\r\n",
+               value, (unsigned int)BQ769X0_UVPThresholdGet());
     }
     else if (strcmp(param, "ovp") == 0)
     {
@@ -260,9 +267,14 @@ static void Cmd_SetParam(const char *param, int value)
             printf("[CMD] ERROR: OVP threshold must be between 2000mV and 5000mV\r\n");
             return;
         }
-        BQ769X0_OVPThresholdSet((uint16_t)value);
+        if (!BQ769X0_OVPThresholdSet((uint16_t)value))
+        {
+            printf("[CMD] ERROR: OVP is outside calibrated HW range or readback failed\r\n");
+            return;
+        }
         BMS_ProtectSetOVMv(value);
-        printf("[CMD] OVP threshold set to %dmV (HW & SW synchronized)\r\n", value);
+        printf("[CMD] OVP requested=%dmV, HW actual=%umV, SW synchronized\r\n",
+               value, (unsigned int)BQ769X0_OVPThresholdGet());
     }
     else if (strcmp(param, "uvdelay") == 0)
     {
@@ -368,12 +380,21 @@ static void Cmd_Protect(void)
     printf("[PROTECT] Pending: OV=%d UV=%d OCD=%d SCD=%d\r\n",
            (int)prot->ov_pending, (int)prot->uv_pending,
            (int)prot->ocd_pending, (int)prot->scd_pending);
+    printf("[PROTECT] OCC=%d OTC=%d OTD=%d LTC=%d LTD=%d FAILSAFE=%d SAFE=%d\r\n",
+           (int)prot->occ_active, (int)prot->otc_active,
+           (int)prot->otd_active, (int)prot->ltc_active,
+           (int)prot->ltd_active, (int)prot->fail_safe_active,
+           (int)prot->safe_off_confirmed);
     printf("[PROTECT] Allow: CHG=%d DSG=%d\r\n",
            (int)prot->charge_allowed, (int)prot->discharge_allowed);
-    printf("[PROTECT] LastFault: %s Cell=%d Value=%lu\r\n",
+    printf("[PROTECT] HW: DEVICE=%d OVRD=%d REARM=%d RESTART=%d\r\n",
+           (int)prot->device_fault_active, (int)prot->ovrd_active,
+           (int)prot->discharge_rearm_required,
+           (int)prot->device_restart_required);
+    printf("[PROTECT] LastFault: %s Cell=%d Value=%ld\r\n",
            BMS_ProtectFaultToString(prot->last_fault),
            (int)prot->last_fault_cell,
-           (unsigned long)prot->last_fault_value);
+           (long)prot->last_fault_value);
 }
 
 static void Cmd_Status(void)
@@ -459,8 +480,16 @@ static void Cmd_Fault(void)
 
 static void Cmd_ChgOn(void)
 {
-    BMS_EnergySetChargeEnable(1);
-    printf("[CMD][CHG] %s\r\n", BMS_ControlResultToString(BMS_ControlChgOn()));
+    BMS_ControlResult_t result;
+
+    /* Publish intent first so any concurrent ALERT can only clear it. */
+    BMS_EnergySetChargeEnable(1U);
+    result = BMS_ControlChgOn();
+    if (result != BMS_CONTROL_OK)
+    {
+        BMS_EnergySetChargeEnable(0U);
+    }
+    printf("[CMD][CHG] %s\r\n", BMS_ControlResultToString(result));
 }
 
 static void Cmd_ChgOff(void)
@@ -471,13 +500,25 @@ static void Cmd_ChgOff(void)
 
 static void Cmd_DsgOn(void)
 {
-    BMS_EnergySetDischargeEnable(1);
-    printf("[CMD][DSG] %s\r\n", BMS_ControlResultToString(BMS_ControlDsgOn()));
+    BMS_ControlResult_t result;
+
+    if (!BMS_EnergySetDischargeEnable(1U))
+    {
+        printf("[CMD][DSG] rejected: cooldown/load-removal/restart recovery gate active\r\n");
+        return;
+    }
+
+    result = BMS_ControlDsgOn();
+    if (result != BMS_CONTROL_OK)
+    {
+        (void)BMS_EnergySetDischargeEnable(0U);
+    }
+    printf("[CMD][DSG] %s\r\n", BMS_ControlResultToString(result));
 }
 
 static void Cmd_DsgOff(void)
 {
-    BMS_EnergySetDischargeEnable(0);
+    (void)BMS_EnergySetDischargeEnable(0U);
     printf("[CMD][DSG] %s\r\n", BMS_ControlResultToString(BMS_ControlDsgOff()));
 }
 
@@ -591,11 +632,26 @@ void BMS_UartCmd_ProcessLine(const char *line)
     }
     else if (strcmp(line, "ship") == 0 || strcmp(line, "shutdown") == 0)
     {
+        if (!BMS_InitIsOk())
+        {
+            printf("[CMD] ERROR: BMS initialization is not complete.\r\n");
+            return;
+        }
         printf("[CMD] CRITICAL: Entering BQ769X0 SHIP mode (shutdown).\r\n");
         printf("[CMD] TS1 high pulse on PA15 is required to wake up.\r\n");
         osDelay(100);
-        BQ769X0_ForceSafeOff();
-        BQ769X0_EntryShip();
+        if (!BQ769X0_ForceSafeOff(BMS_SAFE_OFF_RETRY_COUNT))
+        {
+            printf("[CMD] ERROR: safe-off verification failed; shutdown cancelled.\r\n");
+        }
+        else if (!BQ769X0_EntryShip())
+        {
+            printf("[CMD] ERROR: SHIP command failed.\r\n");
+        }
+        else
+        {
+            BMS_ProtectLatchShutdown();
+        }
     }
     else if (strncmp(line, "set ", 4) == 0)
     {

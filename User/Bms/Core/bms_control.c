@@ -2,6 +2,7 @@
 #include "bms_protect.h"
 #include "bms_monitor.h"
 #include "bms_uart_cmd.h"
+#include "bms_config.h"
 #include "drv_softi2c_bq769x0.h"
 #include <stdio.h>
 
@@ -18,11 +19,11 @@
  * 前置安全检*
  * 检查软件保护状态、硬SYS_STAT 故障位、Monitor 数据有效性、Pack 电压范围
  * 所CHG/DSG 开启操作必须先通过此检* ========================================================================== */
-static BMS_ControlResult_t CheckPreconditions(void)
+/* 检查指定 MOS 开启操作所需的软件保护、硬件故障和电压条件。 */
+static BMS_ControlResult_t CheckPreconditions(uint8_t control_bit)
 {
-    /* 1. 软件保护状态检*/
-    if (BMS_ProtectIsOvActive() || BMS_ProtectIsUvActive() ||
-        BMS_ProtectIsOcdActive() || BMS_ProtectIsScdActive())
+    if (((control_bit == CHG_CONTROL) && !BMS_ProtectIsChargeAllowed()) ||
+        ((control_bit == DSG_CONTROL) && !BMS_ProtectIsDischargeAllowed()))
     {
         return BMS_CONTROL_REJECTED_PROTECT;
     }
@@ -55,6 +56,7 @@ static BMS_ControlResult_t CheckPreconditions(void)
     return BMS_CONTROL_OK;
 }
 
+/* 回读 SYS_CTRL2，确认指定 MOS 控制位达到期望状态。 */
 static BMS_ControlResult_t VerifyControlBit(uint8_t control_bit, uint8_t expect_on)
 {
     uint8_t ctrl2_val = 0;
@@ -67,11 +69,6 @@ static BMS_ControlResult_t VerifyControlBit(uint8_t control_bit, uint8_t expect_
 
     if (expect_on)
     {
-        if ((ctrl2_val & control_bit) != 0)
-        {
-            return BMS_CONTROL_OK;
-        }
-
         if (!BQ769X0_ReadRegisterByteWithCRC(SYS_STAT, &sys_stat))
         {
             return BMS_CONTROL_I2C_ERROR;
@@ -79,6 +76,10 @@ static BMS_ControlResult_t VerifyControlBit(uint8_t control_bit, uint8_t expect_
         if ((sys_stat & BQ_SYS_STAT_FAULT_MASK) != 0)
         {
             return BMS_CONTROL_REJECTED_HW_FAULT;
+        }
+        if ((ctrl2_val & control_bit) != 0)
+        {
+            return BMS_CONTROL_OK;
         }
     }
     else if ((ctrl2_val & control_bit) == 0)
@@ -89,30 +90,71 @@ static BMS_ControlResult_t VerifyControlBit(uint8_t control_bit, uint8_t expect_
     return BMS_CONTROL_VERIFY_ERROR;
 }
 
+/* 在总线锁内开启指定 MOS，并在写后复核保护许可，避免并发竞态。 */
+static BMS_ControlResult_t BMS_ControlTurnOn(BQ769X0_ControlTypedef control)
+{
+    BMS_ControlResult_t result;
+    uint8_t still_allowed;
+
+    BQ769X0_BusLock();
+    result = CheckPreconditions((uint8_t)control);
+    if (result != BMS_CONTROL_OK)
+    {
+        goto out;
+    }
+
+    if (!BQ769X0_ControlDSGOrCHG(control, BQ_STATE_ENABLE))
+    {
+        result = BMS_CONTROL_I2C_ERROR;
+        goto out;
+    }
+
+    result = VerifyControlBit((uint8_t)control, 1U);
+    if (result != BMS_CONTROL_OK)
+    {
+        if (!BQ769X0_ForceSafeOff(BMS_SAFE_OFF_RETRY_COUNT))
+        {
+            result = BMS_CONTROL_VERIFY_ERROR;
+        }
+        goto out;
+    }
+
+    still_allowed = (control == CHG_CONTROL) ? BMS_ProtectIsChargeAllowed()
+                                             : BMS_ProtectIsDischargeAllowed();
+    if (!still_allowed)
+    {
+        if (!BQ769X0_ControlDSGOrCHG(control, BQ_STATE_DISABLE) ||
+            (VerifyControlBit((uint8_t)control, 0U) != BMS_CONTROL_OK))
+        {
+            (void)BQ769X0_ForceSafeOff(BMS_SAFE_OFF_RETRY_COUNT);
+            result = BMS_CONTROL_VERIFY_ERROR;
+        }
+        else
+        {
+            result = BMS_CONTROL_REJECTED_PROTECT;
+        }
+    }
+
+out:
+    BQ769X0_BusUnlock();
+    return result;
+}
+
 /* ==========================================================================
  * CHG MOS 控制
  * ========================================================================== */
 
+/* 在全部安全条件满足时开启充电 MOS。 */
 BMS_ControlResult_t BMS_ControlChgOn(void)
 {
 #if (BMS_UART_CMD_ALLOW_CHG_ON == 0)
     return BMS_CONTROL_DISABLED;
 #else
-    BMS_ControlResult_t ret = CheckPreconditions();
-    if (ret != BMS_CONTROL_OK)
-    {
-        return ret;
-    }
-
-    if (!BQ769X0_ControlDSGOrCHG(CHG_CONTROL, BQ_STATE_ENABLE))
-    {
-        return BMS_CONTROL_I2C_ERROR;
-    }
-
-    return VerifyControlBit(CHG_CONTROL, 1);
+    return BMS_ControlTurnOn(CHG_CONTROL);
 #endif
 }
 
+/* 关闭充电 MOS 并确认寄存器状态。 */
 BMS_ControlResult_t BMS_ControlChgOff(void)
 {
     if (!BQ769X0_ControlDSGOrCHG(CHG_CONTROL, BQ_STATE_DISABLE))
@@ -127,26 +169,17 @@ BMS_ControlResult_t BMS_ControlChgOff(void)
  * DSG MOS 控制
  * ========================================================================== */
 
+/* 在全部安全条件满足时开启放电 MOS。 */
 BMS_ControlResult_t BMS_ControlDsgOn(void)
 {
 #if (BMS_UART_CMD_ALLOW_DSG_ON == 0)
     return BMS_CONTROL_DISABLED;
 #else
-    BMS_ControlResult_t ret = CheckPreconditions();
-    if (ret != BMS_CONTROL_OK)
-    {
-        return ret;
-    }
-
-    if (!BQ769X0_ControlDSGOrCHG(DSG_CONTROL, BQ_STATE_ENABLE))
-    {
-        return BMS_CONTROL_I2C_ERROR;
-    }
-
-    return VerifyControlBit(DSG_CONTROL, 1);
+    return BMS_ControlTurnOn(DSG_CONTROL);
 #endif
 }
 
+/* 关闭放电 MOS 并确认寄存器状态。 */
 BMS_ControlResult_t BMS_ControlDsgOff(void)
 {
     if (!BQ769X0_ControlDSGOrCHG(DSG_CONTROL, BQ_STATE_DISABLE))
@@ -160,33 +193,26 @@ BMS_ControlResult_t BMS_ControlDsgOff(void)
 /* ==========================================================================
  * 均衡寄存器清* ========================================================================== */
 
+/* 关闭全部电芯均衡并确认寄存器状态。 */
 BMS_ControlResult_t BMS_ControlBalanceClear(void)
 {
-    uint8_t bal_write[3] = {0, 0, 0};
-    if (!BQ769X0_WriteBlockWithCRC(CELLBAL1, bal_write, 3))
-    {
-        return BMS_CONTROL_I2C_ERROR;
-    }
-
-    uint8_t bal_read[3] = {0, 0, 0};
-    if (!BQ769X0_ReadBlockWithCRC(CELLBAL1, bal_read, 3))
-    {
-        return BMS_CONTROL_I2C_ERROR;
-    }
-
-    return (bal_read[0] == 0 && bal_read[1] == 0 && bal_read[2] == 0)
+    return BQ769X0_CellBalanceControl(BQ_CELL_ALL, BQ_STATE_DISABLE)
            ? BMS_CONTROL_OK : BMS_CONTROL_I2C_ERROR;
 }
 
+/* 先清空旧均衡位，再应用新的电芯均衡掩码。 */
 BMS_ControlResult_t BMS_ControlBalanceApplyMask(uint16_t cell_mask)
 {
-    /* 先清除所有电芯均衡通道 */
-    BQ769X0_CellBalanceControl(BQ_CELL_ALL, BQ_STATE_DISABLE);
-    
-    /* 如果有使能的均衡，则开启对应的电芯通道 */
-    if (cell_mask != 0)
+    if (!BQ769X0_CellBalanceControl(BQ_CELL_ALL, BQ_STATE_DISABLE))
     {
-        BQ769X0_CellBalanceControl((BQ769X0_CellIndexTypedef)cell_mask, BQ_STATE_ENABLE);
+        return BMS_CONTROL_I2C_ERROR;
+    }
+    
+    if ((cell_mask != 0U) &&
+        !BQ769X0_CellBalanceControl((BQ769X0_CellIndexTypedef)cell_mask,
+                                    BQ_STATE_ENABLE))
+    {
+        return BMS_CONTROL_I2C_ERROR;
     }
     
     return BMS_CONTROL_OK;
@@ -213,38 +239,45 @@ const char *BMS_ControlResultToString(BMS_ControlResult_t result)
 
 /* ==========================================================================
  * 预留与保护模块控制联动接* ========================================================================== */
-void BMS_ControlApplyProtectState(const BMS_ProtectState_t *state)
+/* 按保护状态关闭危险输出，全部回读确认后返回 1。 */
+uint8_t BMS_ControlApplyProtectState(const BMS_ProtectState_t *state)
 {
 #if (BMS_CONTROL_AUTO_APPLY_PROTECT == 1)
+    uint8_t output_safe = 1U;
+
     if (state == NULL)
     {
-        return;
+        return 0U;
     }
 
-    /* 即使以后宏为 1，本阶段也只允许自动关闭 CHG/DSG，不允许自动打开 */
-    /* 本次不要实现自动恢复开 MOS */
+    if (state->any_active && (BMS_ControlBalanceClear() != BMS_CONTROL_OK))
+    {
+        output_safe = 0U;
+    }
+
     if (!state->charge_allowed)
     {
-        if (BMS_ControlIsChgOn())
+        if (BMS_ControlChgOff() != BMS_CONTROL_OK)
         {
-            BMS_ControlChgOff();
-            printf("[PROTECT] Charge forbidden by software protection! CHG forced OFF physically.\r\n");
+            output_safe = 0U;
         }
     }
 
     if (!state->discharge_allowed)
     {
-        if (BMS_ControlIsDsgOn())
+        if (BMS_ControlDsgOff() != BMS_CONTROL_OK)
         {
-            BMS_ControlDsgOff();
-            printf("[PROTECT] Discharge forbidden by software protection! DSG forced OFF physically.\r\n");
+            output_safe = 0U;
         }
     }
+    return output_safe;
 #else
-    (void)state; /* 未开启联动，忽略状态 */
+    (void)state;
+    return 0U;
 #endif
 }
 
+/* 获取充电 MOS 的实际状态，读取失败时返回关闭。 */
 uint8_t BMS_ControlIsChgOn(void)
 {
     uint8_t ctrl2_val = 0;
@@ -255,6 +288,7 @@ uint8_t BMS_ControlIsChgOn(void)
     return 0;
 }
 
+/* 获取放电 MOS 的实际状态，读取失败时返回关闭。 */
 uint8_t BMS_ControlIsDsgOn(void)
 {
     uint8_t ctrl2_val = 0;

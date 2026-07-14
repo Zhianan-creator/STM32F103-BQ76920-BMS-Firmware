@@ -23,10 +23,10 @@ typedef struct
  * BMS HAL Monitor 公开 API 接口
  * ========================================================================== */
 
-/* 初始HAL Monitor 层内部状态与配置*/
+/* 初始化 HAL 监控层内部状态。 */
 int BMS_HAL_MonitorInit(void);
 
-/* 触发底层周期物理采样，并将采样值更新缓存，复制out (若不NULL) */
+/* 采集完整数据快照，任一底层读取失败时返回非零值。 */
 int BMS_HAL_MonitorSample(BMS_HAL_MonitorData_t *out);
 
 /* 获取最新一次采样的内部缓存数据指针 */
@@ -44,10 +44,10 @@ int32_t BMS_HAL_MonitorGetCurrentMa(void);
 /* 读取指定通道温度(°C) */
 int16_t BMS_HAL_MonitorGetTempC(uint8_t index);
 
-/* 查询最新采样数据是否有*/
+/* 查询最近一次采样数据是否有效。 */
 uint8_t BMS_HAL_MonitorIsValid(void);
 
-/* 查询最新采样的系统 Tick 时间*/
+/* 查询最近一次有效采样的系统时刻。 */
 uint32_t BMS_HAL_MonitorGetSampleTick(void);
 
 #endif /* BMS_HAL_MONITOR_H */

@@ -26,6 +26,9 @@
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
 
+#include "bms_config.h"
+#include "bms_hal_watchdog.h"
+
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -77,6 +80,11 @@ int main(void)
   HAL_Init();
 
   /* USER CODE BEGIN Init */
+
+  if (!BMS_HAL_WatchdogStart(BMS_WATCHDOG_BOOT_TIMEOUT_MS))
+  {
+    Error_Handler();
+  }
 
   /* USER CODE END Init */
 
